@@ -1128,6 +1128,47 @@ end
         </programlisting>
 		</example>
 	</section>
+	<section id="registrar.p.event_callback_saved">
+		<title><varname>event_callback_saved</varname> (str)</title>
+		<para>
+			The name of the function in the KEMI configuration file (embedded
+			scripting language such as Lua, Python, ...) to be executed instead
+			of event_route[usrloc:contact-inserted] and
+			event_route[usrloc:contact-updated] blocks.
+		</para>
+		<para>
+			The function receives a string parameter with the name of the
+			event, which can be 'usrloc:contact-inserted' or
+			'usrloc:contact-updated'. The attributes of the contact are
+			available via $ulc(saved=&gt;...). The notes for
+			event_route[usrloc:contact-inserted] apply to the function as well.
+		</para>
+		<para>
+			It is a separate parameter from event_callback, so the function
+			set there is not executed for every saved contact.
+		</para>
+		<para>
+		<emphasis>
+			Default value is 'empty' (no function is executed for events).
+		</emphasis>
+		</para>
+		<example>
+		<title>Set <varname>event_callback_saved</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("registrar", "event_callback_saved", "ksr_registrar_saved_event")
+...
+-- event callback function implemented in Lua
+function ksr_registrar_saved_event(evname)
+    KSR.info("event " .. evname .. " for contact "
+        .. KSR.pv.getw("$ulc(saved=>addr)") .. " of "
+        .. KSR.pv.getw("$ulc(saved=>aor)") .. "\n");
+    return 1;
+end
+...
+        </programlisting>
+		</example>
+	</section>
 	<section id="registrar.p.lookup_filter_mode">
 		<title><varname>lookup_filter_mode</varname> (int)</title>
 		<para>
@@ -1898,6 +1939,64 @@ if(reg_from_user("location", "sip:alice@server.com", "0")) {
 ...
 event_route[usrloc:contact-expired] {
     xlog("expired contact for $ulc(exp=>aor)\n");
+}
+...
+</programlisting>
+		</example>
+
+	</section>
+	<section>
+		<title><varname>event_route[usrloc:contact-inserted]</varname></title>
+		<para>
+		Executed when a new contact has been inserted in the location table,
+		typically on the initial REGISTER of a device. The variable
+		$ulc(saved=&gt;...) is filled with the attributes of the new contact.
+		</para>
+		<para>
+		The event is triggered by the usrloc module for every inserted
+		contact, no matter if the insert is done by save(), by RPC commands
+		(e.g., ul.add) or by replication (e.g., dmq_usrloc). When it is
+		triggered by save(), the event route is executed in the context of
+		the SIP message being processed, therefore its headers,
+		pseudo-variables, AVPs and XAVPs are available; otherwise a faked SIP
+		message is used.
+		</para>
+		<para>
+		Note that the event route is executed while the location record is
+		locked: it must not call functions that access the same location
+		table (e.g., save(), lookup(), registered(), ...) and it should not
+		send SIP replies, those are handled by save().
+		</para>
+		<para>
+		For KEMI configurations, see the event_callback_saved parameter.
+		</para>
+		<example>
+		<title><function>event_route[usrloc:contact-inserted]</function> usage</title>
+		<programlisting format="linespecific">
+...
+event_route[usrloc:contact-inserted] {
+    xlog("new contact $ulc(saved=>addr) for $ulc(saved=>aor) from $si:$sp\n");
+}
+...
+</programlisting>
+		</example>
+
+	</section>
+	<section>
+		<title><varname>event_route[usrloc:contact-updated]</varname></title>
+		<para>
+		Executed when an existing contact has been updated in the location
+		table, typically on a REGISTER refresh of a device. The variable
+		$ulc(saved=&gt;...) is filled with the attributes of the updated
+		contact. The notes for event_route[usrloc:contact-inserted] apply
+		here as well.
+		</para>
+		<example>
+		<title><function>event_route[usrloc:contact-updated]</function> usage</title>
+		<programlisting format="linespecific">
+...
+event_route[usrloc:contact-updated] {
+    xlog("contact $ulc(saved=>addr) refreshed for $ulc(saved=>aor), expires at $ulc(saved=>expires)\n");
 }
 ...
 </programlisting>

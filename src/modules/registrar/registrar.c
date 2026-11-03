@@ -144,6 +144,11 @@ int reg_sock_mode = 0;
 /* where to go for event route ("usrloc:contact-expired") */
 int reg_expire_event_rt = -1; /* default disabled */
 str reg_event_callback = STR_NULL;
+/* where to go for event routes ("usrloc:contact-inserted" and
+ * "usrloc:contact-updated") */
+int reg_insert_event_rt = -1; /* default disabled */
+int reg_update_event_rt = -1; /* default disabled */
+str reg_event_callback_saved = STR_NULL;
 
 int reg_lookup_filter_mode = 0;
 int reg_min_expires_mode = 0;
@@ -257,6 +262,7 @@ static param_export_t params[] = {
 	{"flow_timer", PARAM_INT, &reg_flow_timer},
 	{"contact_max_size", PARAM_INT, &contact_max_size},
 	{"event_callback", PARAM_STR, &reg_event_callback},
+	{"event_callback_saved", PARAM_STR, &reg_event_callback_saved},
 	{"lookup_filter_mode", PARAM_INT, &reg_lookup_filter_mode},
 	{"min_expires_mode", PARAM_INT, &reg_min_expires_mode},
 	{"use_expired_contacts", PARAM_INT,
@@ -302,6 +308,7 @@ static int mod_init(void)
 	str s;
 	bind_usrloc_t bind_usrloc;
 	qvalue_t dq;
+	int ulcb_types = 0;
 
 	if(sruid_init(&_reg_sruid, '-', "uloc", SRUID_INC) < 0) {
 		return -1;
@@ -391,6 +398,43 @@ static int mod_init(void)
 					   UL_CONTACT_EXPIRE, reg_ul_expired_contact, 0)
 					< 0) {
 				LM_ERR("Can not register callback for expired contacts"
+					   " (usrloc module)\n");
+				return -1;
+			}
+		}
+		/* usrloc:contact-inserted and usrloc:contact-updated events */
+		if(reg_event_callback_saved.s == NULL
+				|| reg_event_callback_saved.len <= 0) {
+			reg_event_callback_saved.s = NULL;
+			reg_event_callback_saved.len = 0;
+			reg_insert_event_rt =
+					route_lookup(&event_rt, "usrloc:contact-inserted");
+			if(reg_insert_event_rt >= 0
+					&& event_rt.rlist[reg_insert_event_rt] == 0)
+				reg_insert_event_rt = -1; /* disable */
+			if(reg_insert_event_rt >= 0)
+				ulcb_types |= UL_CONTACT_INSERT;
+			reg_update_event_rt =
+					route_lookup(&event_rt, "usrloc:contact-updated");
+			if(reg_update_event_rt >= 0
+					&& event_rt.rlist[reg_update_event_rt] == 0)
+				reg_update_event_rt = -1; /* disable */
+			if(reg_update_event_rt >= 0)
+				ulcb_types |= UL_CONTACT_UPDATE;
+		} else {
+			if(sr_kemi_eng_get() == NULL) {
+				LM_DBG("event callback saved (%s) set, but no cfg engine\n",
+						reg_event_callback_saved.s);
+				reg_event_callback_saved.s = NULL;
+				reg_event_callback_saved.len = 0;
+			} else {
+				ulcb_types |= UL_CONTACT_INSERT | UL_CONTACT_UPDATE;
+			}
+		}
+		if(ulcb_types != 0) {
+			set_child_rpc_sip_mode();
+			if(_reg_ul.register_ulcb(ulcb_types, reg_ul_saved_contact, 0) < 0) {
+				LM_ERR("Can not register callback for saved contacts"
 					   " (usrloc module)\n");
 				return -1;
 			}
