@@ -120,6 +120,7 @@ str _ksr_xavp_via_params = STR_NULL;
 str _ksr_xavp_via_fields = STR_NULL;
 str _ksr_xavp_via_reply_params = STR_NULL;
 int ksr_local_rport = 0;
+int ksr_via_conid_mode = 0;
 str _ksr_via_body_flags = str_init("kvf");
 int ksr_msg_apply_changes_mode = 0;
 
@@ -725,6 +726,13 @@ static inline int lumps_len(
 				LM_CRIT("null bind_address (SUBST_RCV_ALL)\n");              \
 			};                                                               \
 			break;                                                           \
+		case SUBST_RCV_SOCKNAME:                                             \
+			if(msg->rcv.bind_address                                         \
+					&& msg->rcv.bind_address->sockname.len > 0) {            \
+				new_len += SOCKNAME_PARAM_LEN                                \
+						   + msg->rcv.bind_address->sockname.len;            \
+			}                                                                \
+			break;                                                           \
 		case SUBST_SND_IP:                                                   \
 			if(send_sock) {                                                  \
 				new_len += send_address_str->len;                            \
@@ -820,6 +828,11 @@ static inline int lumps_len(
 			} else {                                                         \
 				LM_CRIT("null send_sock (SUBST_SND_ALL)\n");                 \
 			};                                                               \
+			break;                                                           \
+		case SUBST_SND_SOCKNAME:                                             \
+			if(send_sock && send_sock->sockname.len > 0) {                   \
+				new_len += SOCKNAME_PARAM_LEN + send_sock->sockname.len;     \
+			}                                                                \
 			break;                                                           \
 		case SUBST_NOP: /* do nothing */                                     \
 			break;                                                           \
@@ -1172,6 +1185,16 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 						msg->rcv.bind_address, recv_address_str);              \
 			};                                                                 \
 			break;                                                             \
+		case SUBST_RCV_SOCKNAME:                                               \
+			if(msg->rcv.bind_address                                           \
+					&& msg->rcv.bind_address->sockname.len > 0) {              \
+				memcpy(new_buf + offset, SOCKNAME_PARAM, SOCKNAME_PARAM_LEN);  \
+				offset += SOCKNAME_PARAM_LEN;                                  \
+				memcpy(new_buf + offset, msg->rcv.bind_address->sockname.s,    \
+						msg->rcv.bind_address->sockname.len);                  \
+				offset += msg->rcv.bind_address->sockname.len;                 \
+			}                                                                  \
+			break;                                                             \
 		case SUBST_SND_IP:                                                     \
 			if(send_sock) {                                                    \
 				if((send_af == AF_INET6) && (send_address_str->s[0] != '[')) { \
@@ -1287,6 +1310,15 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 			} else {                                                           \
 				LM_CRIT("null send_sock (SUBST_SND_ALL)\n");                   \
 			};                                                                 \
+			break;                                                             \
+		case SUBST_SND_SOCKNAME:                                               \
+			if(send_sock && send_sock->sockname.len > 0) {                     \
+				memcpy(new_buf + offset, SOCKNAME_PARAM, SOCKNAME_PARAM_LEN);  \
+				offset += SOCKNAME_PARAM_LEN;                                  \
+				memcpy(new_buf + offset, send_sock->sockname.s,                \
+						send_sock->sockname.len);                              \
+				offset += send_sock->sockname.len;                             \
+			}                                                                  \
 			break;                                                             \
 		case SUBST_RCV_PROTO:                                                  \
 			if(msg->rcv.bind_address) {                                        \
@@ -1437,7 +1469,9 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 		if(t->flags & LUMPFLAG_APPLIED) {
 			continue;
 		}
-		t->flags |= LUMPFLAG_APPLIED;
+		if(!(flag & FLAG_MSG_DRYRUN)) {
+			t->flags |= LUMPFLAG_APPLIED;
+		}
 		switch(t->op) {
 			case LUMP_ADD:
 			case LUMP_ADD_SUBST:
@@ -1523,17 +1557,17 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 					break;
 				}
 				size = t->u.offset - s_offset;
-				if(size > 0 && flag == FLAG_MSG_ALL) {
+				if(size > 0 && (flag & FLAG_MSG_ALL)) {
 					memcpy(new_buf + offset, orig + s_offset, size);
 					offset += size;
 					s_offset += size;
-				} else if(flag == FLAG_MSG_LUMPS_ONLY) {
+				} else if(flag & FLAG_MSG_LUMPS_ONLY) {
 					/* do not copy the whole message, jump to the lumps offs */
 					s_offset += size;
 				}
 
 				/* the LUMP_DELs are printed with "- " before them */
-				if(t->op == LUMP_DEL && flag == FLAG_MSG_LUMPS_ONLY) {
+				if(t->op == LUMP_DEL && (flag & FLAG_MSG_LUMPS_ONLY)) {
 					new_buf[offset++] = '-';
 					new_buf[offset++] = ' ';
 				}
@@ -1562,10 +1596,10 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 				}
 			skip_nop_before:
 				/* process main (del only) */
-				if(t->op == LUMP_DEL && flag == FLAG_MSG_ALL) {
+				if(t->op == LUMP_DEL && (flag & FLAG_MSG_ALL)) {
 					/* skip len bytes from orig msg */
 					s_offset += t->len;
-				} else if(t->op == LUMP_DEL && flag == FLAG_MSG_LUMPS_ONLY) {
+				} else if(t->op == LUMP_DEL && (flag & FLAG_MSG_LUMPS_ONLY)) {
 					/* copy lump value and indent as necessarily */
 					memcpy(new_buf + offset, orig + t->u.offset, t->len);
 					offset += t->len;
@@ -1609,7 +1643,7 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 	*orig_offs = s_offset;
 
 	/* add '\0' to char* lump list to print it smoothly */
-	if(flag == FLAG_MSG_LUMPS_ONLY) {
+	if(flag & FLAG_MSG_LUMPS_ONLY) {
 		new_buf[offset] = '\0';
 	}
 #undef RCVCOMP_PARAM_ADD
@@ -1743,6 +1777,10 @@ error:
 	return -1;
 }
 
+/**
+ * find the line that starts with text
+ * - update *buf to the start of the line and adjust *buf_len
+ */
 static inline int find_line_start(
 		char *text, unsigned int text_len, char **buf, unsigned int *buf_len)
 {
@@ -1760,8 +1798,10 @@ static inline int find_line_start(
 		}
 		if((ch = memchr(start, 13, len - 1))) {
 			if(*(ch + 1) != 10) {
-				LM_ERR("No LF after CR\n");
-				return 0;
+				/* allow single CR (0x0D) byte inside a body part */
+				len = len - (ch - start + 1);
+				start = ch + 1;
+				continue;
 			}
 			len = len - (ch - start + 2);
 			start = ch + 2;
@@ -1897,6 +1937,7 @@ int check_boundaries(struct sip_msg *msg, struct dest_info *send_info)
 	int t, ret;
 	int lb_size = 0;
 	char *pb;
+	char *pe;
 
 	if(!(msg->msg_flags & FL_BODY_MULTIPART)) {
 		LM_DBG("no multi-part body\n");
@@ -1909,6 +1950,16 @@ int check_boundaries(struct sip_msg *msg, struct dest_info *send_info)
 				return -2;
 			}
 			return -1;
+		}
+		/* get_boundary() returns success with an empty boundary when the
+		 * Content-Type has parameters but no "boundary=" value. Rewriting with
+		 * an empty boundary would spin forever in the scan loop below, because
+		 * find_line_start() matches a zero-length boundary on every line and
+		 * never advances. Treat it like the no-boundary case and bail out. */
+		if(ob.s == NULL || ob.len == 0) {
+			LM_INFO("no boundary value in Content-Type, skipping multipart "
+					"rewrite\n");
+			return -2;
 		}
 		buf.s = build_body(msg, (unsigned int *)&buf.len, &ret, send_info);
 		if(ret) {
@@ -1942,6 +1993,10 @@ int check_boundaries(struct sip_msg *msg, struct dest_info *send_info)
 					lb_t = lb_f;
 				} else {
 					lb_t = append_str_list(tmp.s, tmp.len, &lb_t, &lb_size);
+					if(lb_t == NULL) {
+						LM_ERR("failed to append boundary match to list\n");
+						goto error;
+					}
 				}
 				lb_found = lb_found + 1;
 				tmp.s = tmp.s + ret;
@@ -1956,31 +2011,46 @@ int check_boundaries(struct sip_msg *msg, struct dest_info *send_info)
 			LM_ERR("found[%d] wrong number of boundaries\n", lb_found);
 			goto error;
 		}
-		/* adding 2 chars in advance */
-		body.len = buf.len + 2;
+		/* old "buf.len + 2" was too small: the closing boundary may be
+		 * rewritten to the longer final form "fb"; reserve fb.len extra and
+		 * bound-check every copy below so the buffer can never be overrun */
+		body.len = buf.len + fb.len;
 		body.s = pkg_malloc(sizeof(char) * body.len);
 		if(!body.s) {
 			PKG_MEM_ERROR;
 			goto error;
 		}
 		pb = body.s;
+		pe = body.s + body.len; /* one past the end of the allocation */
 		body.len = 0;
 		lb_t = lb_f;
 		while(lb_t) {
+			if(lb_t->next == NULL) {
+				LM_ERR("malformed boundary list\n");
+				goto error;
+			}
 			tmp.s = lb_t->s.s;
 			tmp.len = lb_t->s.len;
 			tmp.len = get_line(lb_t->s);
 			if(tmp.len != b.len || strncmp(b.s, tmp.s, b.len) != 0) {
 				LM_DBG("malformed boundary in the middle\n");
+				t = lb_t->next->s.s - (lb_t->s.s + tmp.len);
+				if(t < 0 || pb + b.len + t > pe) {
+					LM_ERR("body rebuild would overflow buffer\n");
+					goto error;
+				}
 				memcpy(pb, b.s, b.len);
 				body.len = body.len + b.len;
 				pb = pb + b.len;
-				t = lb_t->next->s.s - (lb_t->s.s + tmp.len);
 				memcpy(pb, lb_t->s.s + tmp.len, t);
 				pb = pb + t;
 				/*LM_DBG("new chunk[%d][%.*s]\n", t, t, pb-t);*/
 			} else {
 				t = lb_t->next->s.s - lb_t->s.s;
+				if(t < 0 || pb + t > pe) {
+					LM_ERR("body rebuild would overflow buffer\n");
+					goto error;
+				}
 				memcpy(pb, lb_t->s.s, t);
 				/*LM_DBG("copy[%d][%.*s]\n", t, t, pb);*/
 				pb = pb + t;
@@ -1997,11 +2067,19 @@ int check_boundaries(struct sip_msg *msg, struct dest_info *send_info)
 		tmp.len = get_line(lb_l->s);
 		if(tmp.len != fb.len || strncmp(fb.s, tmp.s, fb.len) != 0) {
 			LM_DBG("last bondary without -- at the end\n");
+			if(pb + fb.len > pe) {
+				LM_ERR("body rebuild would overflow buffer\n");
+				goto error;
+			}
 			memcpy(pb, fb.s, fb.len);
 			/*LM_DBG("new chunk[%d][%.*s]\n", fb.len, fb.len, pb);*/
 			pb = pb + fb.len;
 			body.len = body.len + fb.len;
 		} else {
+			if(lb_l->s.len < 0 || pb + lb_l->s.len > pe) {
+				LM_ERR("body rebuild would overflow buffer\n");
+				goto error;
+			}
 			memcpy(pb, lb_l->s.s, lb_l->s.len);
 			pb = pb + lb_l->s.len;
 			body.len = body.len + lb_l->s.len;
@@ -2369,9 +2447,9 @@ after_update_via1:
 	new_buf[new_len] = 0;
 	/* copy msg adding/removing lumps */
 	process_lumps(msg, msg->add_rm, new_buf, &offset, &s_offset, send_info,
-			FLAG_MSG_ALL);
+			FLAG_MSG_ALL | ((mode & BUILD_DRYRUN) ? FLAG_MSG_DRYRUN : 0));
 	process_lumps(msg, msg->body_lumps, new_buf, &offset, &s_offset, send_info,
-			FLAG_MSG_ALL);
+			FLAG_MSG_ALL | ((mode & BUILD_DRYRUN) ? FLAG_MSG_DRYRUN : 0));
 	/* copy the rest of the message */
 	memcpy(new_buf + offset, buf + s_offset, len - s_offset);
 	new_buf[new_len] = 0;
@@ -2494,10 +2572,10 @@ char *generate_res_buf_from_sip_res(
 	new_buf[new_len] = 0; /* debug: print the message */
 	offset = s_offset = 0;
 	/* note: no send sock*/
-	process_lumps(
-			msg, msg->add_rm, new_buf, &offset, &s_offset, 0, FLAG_MSG_ALL);
-	process_lumps(
-			msg, msg->body_lumps, new_buf, &offset, &s_offset, 0, FLAG_MSG_ALL);
+	process_lumps(msg, msg->add_rm, new_buf, &offset, &s_offset, 0,
+			FLAG_MSG_ALL | ((mode & BUILD_DRYRUN) ? FLAG_MSG_DRYRUN : 0));
+	process_lumps(msg, msg->body_lumps, new_buf, &offset, &s_offset, 0,
+			FLAG_MSG_ALL | ((mode & BUILD_DRYRUN) ? FLAG_MSG_DRYRUN : 0));
 	/* copy the rest of the message */
 	memcpy(new_buf + offset, buf + s_offset, len - s_offset);
 	/* send it! */
@@ -2512,9 +2590,9 @@ error:
 }
 
 char *build_res_buf_from_sip_res(
-		struct sip_msg *msg, unsigned int *returned_len)
+		struct sip_msg *msg, unsigned int *returned_len, unsigned int mode)
 {
-	return generate_res_buf_from_sip_res(msg, returned_len, 0);
+	return generate_res_buf_from_sip_res(msg, returned_len, mode);
 }
 
 char *build_res_buf_from_sip_req(unsigned int code, str *text, str *new_tag,
@@ -2540,6 +2618,7 @@ char *build_res_buf_from_sip_req(unsigned int code, str *text, str *new_tag,
 	int httpreq;
 	char *pvia;
 	str xparams = STR_NULL;
+	hdr_flags_t copied_sip_quad_hf = 0;
 
 	body = 0;
 	buf = 0;
@@ -2599,6 +2678,8 @@ char *build_res_buf_from_sip_req(unsigned int code, str *text, str *new_tag,
 	for(hdr = msg->headers; hdr; hdr = hdr->next) {
 		switch(hdr->type) {
 			case HDR_TO_T:
+				if(hdr != msg->to)
+					break;
 				if(new_tag && new_tag->len) {
 					to_tag = get_to(msg)->tag_value;
 					if(to_tag.len && to_tag.s)
@@ -2618,10 +2699,21 @@ char *build_res_buf_from_sip_req(unsigned int code, str *text, str *new_tag,
 				/* RR only for 1xx and 2xx replies */
 				if(code < 180 || code >= 300)
 					break;
+				len += hdr->len;
+				break;
 			case HDR_FROM_T:
+				if(hdr != msg->from)
+					break;
+				len += hdr->len;
+				break;
 			case HDR_CALLID_T:
+				if(hdr != msg->callid)
+					break;
+				len += hdr->len;
+				break;
 			case HDR_CSEQ_T:
-				/* we keep the original termination for these headers*/
+				if(hdr != msg->cseq)
+					break;
 				len += hdr->len;
 				break;
 			default:
@@ -2750,6 +2842,9 @@ char *build_res_buf_from_sip_req(unsigned int code, str *text, str *new_tag,
 				append_str(p, hdr->name.s, hdr->len);
 				break;
 			case HDR_TO_T:
+				if(copied_sip_quad_hf & HDR_TO_F)
+					break;
+				copied_sip_quad_hf |= HDR_TO_F;
 				if(new_tag && new_tag->len) {
 					if(to_tag.len && to_tag.s) { /* replacement */
 						/* before to-tag */
@@ -2784,10 +2879,24 @@ char *build_res_buf_from_sip_req(unsigned int code, str *text, str *new_tag,
 					bmark->to_tag_val.s =
 							p + (hdr->body.s + hdr->body.len - hdr->name.s);
 				}
-				/* no break */
+				append_str(p, hdr->name.s, hdr->len);
+				break;
 			case HDR_FROM_T:
+				if(copied_sip_quad_hf & HDR_FROM_F)
+					break;
+				copied_sip_quad_hf |= HDR_FROM_F;
+				append_str(p, hdr->name.s, hdr->len);
+				break;
 			case HDR_CALLID_T:
+				if(copied_sip_quad_hf & HDR_CALLID_F)
+					break;
+				copied_sip_quad_hf |= HDR_CALLID_F;
+				append_str(p, hdr->name.s, hdr->len);
+				break;
 			case HDR_CSEQ_T:
+				if(copied_sip_quad_hf & HDR_CSEQ_F)
+					break;
+				copied_sip_quad_hf |= HDR_CSEQ_F;
 				append_str(p, hdr->name.s, hdr->len);
 				break;
 			default:
@@ -3128,8 +3237,6 @@ char *via_builder(unsigned int *len, sip_msg_t *msg,
 
 	extra_len = 0;
 
-	via_len = via_prefix_len + address_str->len; /*space included in MY_VIA*/
-
 	memcpy(line_buf, MY_VIA, MY_VIA_LEN);
 	if(proto == PROTO_UDP) {
 		/* do nothing */
@@ -3151,6 +3258,9 @@ char *via_builder(unsigned int *len, sip_msg_t *msg,
 		if(likely(port)) {
 			su2ip_addr(&ip, &send_info->to);
 			con = tcpconn_get(send_info->id, &ip, port, from, 0);
+			if(con == NULL && from != NULL) {
+				con = tcpconn_get(send_info->id, &ip, port, NULL, 0);
+			}
 		} else if(likely(send_info->id))
 			con = tcpconn_get(send_info->id, 0, 0, 0, 0);
 		else {
@@ -3160,24 +3270,40 @@ char *via_builder(unsigned int *len, sip_msg_t *msg,
 		}
 
 		if(con == NULL) {
-			LM_WARN("TCP/TLS connection (id: %d) for WebSocket could not be "
-					"found - likely it is gone (dst: [%s]:%d)\n",
-					send_info->id, (port) ? ip_addr2a(&ip) : "", port);
-			pkg_free(line_buf);
-			return 0;
-		}
-
-		if(con->rcv.proto == PROTO_WS) {
-			memcpy(line_buf + MY_VIA_LEN - 4, "WS ", 3);
-		} else if(con->rcv.proto == PROTO_WSS) {
-			memcpy(line_buf + MY_VIA_LEN - 4, "WSS ", 4);
+			if(!(send_info->send_flags.f & SND_F_WSX_OUTBOUND)) {
+				if(is_printable(L_DBG)) {
+					tcpconn_log_candidates(send_info->id, (port) ? &ip : NULL,
+							port, from, proto);
+				}
+				LM_WARN("TCP/TLS connection (id: %d) for WebSocket could not "
+						"be found - likely it is gone (dst: [%s]:%d) (sock: "
+						"[%s])\n",
+						send_info->id, (port) ? ip_addr2a(&ip) : "", port,
+						(from) ? send_info->send_sock->sock_str.s : "*");
+				pkg_free(line_buf);
+				return 0;
+			} else {
+				if(proto == PROTO_WS) {
+					memcpy(line_buf + MY_VIA_LEN - 4, "WS ", 3);
+					via_prefix_len--;
+				} else {
+					memcpy(line_buf + MY_VIA_LEN - 4, "WS ", 4);
+				}
+			}
 		} else {
-			tcpconn_put(con);
-			LM_CRIT("unknown proto %d\n", con->rcv.proto);
-			pkg_free(line_buf);
-			return 0;
+			if(con->rcv.proto == PROTO_WS) {
+				memcpy(line_buf + MY_VIA_LEN - 4, "WS ", 3);
+				via_prefix_len--;
+			} else if(con->rcv.proto == PROTO_WSS) {
+				memcpy(line_buf + MY_VIA_LEN - 4, "WSS ", 4);
+			} else {
+				tcpconn_chld_put(con);
+				LM_CRIT("unknown proto %d\n", con->rcv.proto);
+				pkg_free(line_buf);
+				return 0;
+			}
+			tcpconn_chld_put(con);
 		}
-		tcpconn_put(con);
 	} else if(proto == PROTO_WSS) {
 		memcpy(line_buf + MY_VIA_LEN - 4, "WSS ", 4);
 	} else {
@@ -3185,6 +3311,9 @@ char *via_builder(unsigned int *len, sip_msg_t *msg,
 		pkg_free(line_buf);
 		return 0;
 	}
+
+	via_len = via_prefix_len + address_str->len; /*space included in MY_VIA*/
+
 	/* add [] only if ipv6 address is used;
 	 * if using pre-set no check is made */
 	if(send_sock != NULL && send_sock->address.af == AF_INET6) {
@@ -3266,8 +3395,9 @@ char *create_via_hf(unsigned int *len, struct sip_msg *msg,
 
 
 #if defined USE_TCP || defined USE_SCTP
-	/* add id if tcp */
-	if(msg
+	/* add id if tcp, in mode 1 only if rport does not lead back to the
+	 * connection */
+	if(msg && !(ksr_via_conid_mode == 1 && rport_test(msg))
 			&& (
 #ifdef USE_TCP
 					(msg->rcv.proto == PROTO_TCP)

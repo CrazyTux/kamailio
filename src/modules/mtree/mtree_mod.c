@@ -212,6 +212,12 @@ static int mod_init(void)
 	if(mt_fetch_rows <= 0)
 		mt_fetch_rows = 1000;
 
+	/* Ensure the prefix character table is initialized before workers fork. */
+	if(mt_char_table_init(0) < 0) {
+		LM_ERR("failed to init prefix char table\n");
+		return -1;
+	}
+
 	/* binding to database module */
 	if(db_bind_mod(&db_url, &mt_dbf)) {
 		LM_ERR("database module not found\n");
@@ -612,7 +618,7 @@ static int mt_load_db(m_tree_t *pt)
 		}
 	} else {
 		if((ret = mt_dbf.query(db_con, key_cols, op, vals, db_cols, pt->multi,
-					2, 0, &db_res))
+					c, 0, &db_res))
 						!= 0
 				|| RES_ROW_N(db_res) <= 0) {
 			if(ret == 0) {

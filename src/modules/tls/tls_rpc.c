@@ -43,8 +43,6 @@
 #include "tls_rpc.h"
 #include "tls_cfg.h"
 
-extern int ksr_tcp_main_threads;
-
 /*
  * packed into a single shm alloc: [ tcpx_task_t | tls_reload_task_t ]
  * input params and result are both carried in tls_reload_task_t so no
@@ -110,11 +108,8 @@ static int tls_reload_do(str *config_file, char *errmsg, int errmsg_size)
 
 #ifdef KSR_SSL_COMMON
 	/* reload HSM/engine keys into the new SSL_CTX.
-	 * tls_fix_domains_cfg only handles soft keys — without this,
-	 * tls.reload silently leaves the new ctx with no private key,
-	 * breaking all subsequent TLS handshakes until restart.
-	 * Fixes the pre-existing bug for both tcp_main_threads==0 and >0. */
-	if(tls_reload_engine_keys() < 0) {
+	 */
+	if(ksr_tcp_main_threads > 0 && tls_reload_engine_keys() < 0) {
 		snprintf(errmsg, errmsg_size,
 				"TLS config reloaded but HSM/engine key reload failed"
 				" (consult server log)");
@@ -131,6 +126,7 @@ static int tls_reload_do(str *config_file, char *errmsg, int errmsg_size)
  *
  * Runs in PROC_TCP_MAIN thread context — SSL_CTX owned here.
  * Calls tls_reload_do then signals result back via ksr_tcpx_thread_eresult.
+ * keep in sync with tls_wolfssl/tls_rpc.c
  */
 static void tls_reload_mt_thread_cb(void *p, int pidx)
 {
@@ -277,6 +273,8 @@ static void tls_list(rpc_t *rpc, void *c)
 	struct tm timestamp;
 	char timestamp_s[128];
 	const char *sni, *dom;
+	char sni_buf[256];
+	char tls_info_buf[sizeof(((struct tls_extra_data *)0)->ssl_cipher_desc)];
 
 	TCPCONN_LOCK;
 	for(i = 0; i < TCP_ID_HASH_SIZE; i++) {
@@ -308,11 +306,21 @@ static void tls_list(rpc_t *rpc, void *c)
 			}
 
 			if(tls_d) {
-				sni = tls_d->ssl_servername;
-				dom = tls_d->dom.s;
-				if(sni == NULL) {
+				/* copy out of the ssl cache: it can be rebuilt (and the old
+				 * buffers freed) after a renegotiation */
+				tls_ssl_cache_lock(tls_d);
+				if(tls_d->ssl_servername != NULL) {
+					snprintf(sni_buf, sizeof(sni_buf), "%s",
+							tls_d->ssl_servername);
+					sni = sni_buf;
+				} else {
 					sni = "N/A";
 				}
+				memcpy(tls_info_buf, tls_d->ssl_cipher_desc,
+						sizeof(tls_info_buf));
+				tls_info_buf[sizeof(tls_info_buf) - 1] = '\0';
+				tls_ssl_cache_unlock(tls_d);
+				dom = tls_d->dom.s;
 			} else {
 				sni = "N/A";
 				dom = "N/A";
@@ -323,7 +331,7 @@ static void tls_list(rpc_t *rpc, void *c)
 					"src_ip", src_ip, "src_port", con->rcv.src_port, "dst_ip",
 					dst_ip, "dst_port", con->rcv.dst_port);
 			if(tls_d) {
-				tls_info = tls_d->ssl_cipher_desc;
+				tls_info = tls_info_buf;
 				/* tls data */
 				state = "unknown/error";
 				lock_get(&con->write_lock);

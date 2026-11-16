@@ -67,6 +67,7 @@
 #include "../../core/lvalue.h"
 #include "../../core/globals.h"
 #include "../../core/parser/parse_to.h"
+#include "../../core/parser/contact/parse_contact.h"
 #include "../../modules/tm/tm_load.h"
 #include "../../core/rpc_lookup.h"
 #include "../../core/srapi.h"
@@ -93,6 +94,7 @@ MODULE_VERSION
 static int mod_init(void);
 static int child_init(int rank);
 static void mod_destroy(void);
+static void warn_dmq_load_callback_modules(void);
 
 /* module parameter */
 static int dlg_hash_size = 4096;
@@ -117,6 +119,10 @@ int dlg_noack_timeout = 60;
 int dlg_end_timeout = 300;
 
 int dlg_enable_dmq = 0;
+str dlg_dmq_peer_id = str_init("dialog");
+int dlg_dmq_ka_iflags_sync = 0;
+int dlg_dmq_timeout_iflags_sync = 0;
+int dlg_dmq_load_callbacks = 0;
 
 int dlg_event_rt[DLG_EVENTRT_MAX];
 str dlg_event_callback = STR_NULL;
@@ -202,7 +208,13 @@ static int fixup_dlg_refer(void **param, int param_no);
 static int fixup_dlg_bridge(void **param, int param_no);
 static int w_dlg_get(struct sip_msg *, char *, char *, char *);
 static int w_is_known_dlg(struct sip_msg *);
+static int w_dlg_remove_dialogs_from_node(
+		struct sip_msg *msg, char *uri, char *s2);
 static int w_dlg_set_ruri(sip_msg_t *, char *, char *);
+static int w_dlg_update_contact(sip_msg_t *, char *, char *);
+static int ki_dlg_update_contact(sip_msg_t *msg);
+static int w_dlg_update_socket(sip_msg_t *, char *, char *);
+static int ki_dlg_update_socket(sip_msg_t *msg);
 static int w_dlg_db_load_callid(sip_msg_t *msg, char *ci, char *p2);
 static int w_dlg_db_load_extra(sip_msg_t *msg, char *p1, char *p2);
 static int fixup_dlg_get_var(void **param, int param_no);
@@ -277,6 +289,8 @@ static cmd_export_t cmds[]={
 			0, ANY_ROUTE },
 	{"is_known_dlg", (cmd_function)w_is_known_dlg,        0, NULL,
 			0, ANY_ROUTE },
+	{"dlg_remove_dialogs_from_node", (cmd_function)w_dlg_remove_dialogs_from_node, 1, fixup_spve_null,
+			0, ANY_ROUTE },
 	{"dlg_set_timeout", (cmd_function)w_dlg_set_timeout,  1,fixup_igp_null,
 			0, ANY_ROUTE },
 	{"dlg_set_timeout", (cmd_function)w_dlg_set_timeout,  3,fixup_igp_all,
@@ -294,6 +308,10 @@ static cmd_export_t cmds[]={
 	{"dlg_remote_profile", (cmd_function)w_dlg_remote_profile, 5, fixup_dlg_remote_profile,
 			0, ANY_ROUTE },
 	{"dlg_set_ruri",       (cmd_function)w_dlg_set_ruri,  0, NULL,
+			0, ANY_ROUTE },
+	{"dlg_update_contact", (cmd_function)w_dlg_update_contact, 0, NULL,
+			0, ANY_ROUTE },
+	{"dlg_update_socket",  (cmd_function)w_dlg_update_socket, 0, NULL,
 			0, ANY_ROUTE },
 	{"dlg_db_load_callid", (cmd_function)w_dlg_db_load_callid, 1, fixup_spve_null,
 			0, ANY_ROUTE },
@@ -375,6 +393,9 @@ static param_export_t mod_params[]={
 	{ "db_skip_load",          PARAM_INT, &db_skip_load             },
 	{ "ka_failed_limit",       PARAM_INT, &dlg_ka_failed_limit      },
 	{ "enable_dmq",            PARAM_INT, &dlg_enable_dmq           },
+	{ "dmq_ka_iflags_sync",    PARAM_INT, &dlg_dmq_ka_iflags_sync   },
+	{ "dmq_timeout_iflags_sync", PARAM_INT, &dlg_dmq_timeout_iflags_sync },
+	{ "dmq_load_callbacks",    PARAM_INT, &dlg_dmq_load_callbacks },
 	{ "event_callback",        PARAM_STR, &dlg_event_callback       },
 	{ "early_timeout",         PARAM_INT, &dlg_early_timeout        },
 	{ "noack_timeout",         PARAM_INT, &dlg_noack_timeout        },
@@ -388,6 +409,7 @@ static param_export_t mod_params[]={
 	{ "dlg_ctxiuid_mode",      PARAM_INT, &dlg_ctxiuid_mode         },
 	{ "debug_variables",       PARAM_INT, &debug_variables_list     },
 	{ "dlg_mode",              PARAM_INT, &dlg_process_mode         },
+	{ "dmq_peer_id",           PARAM_STR, &dlg_dmq_peer_id          },
 
 	{ 0,0,0 }
 };
@@ -540,10 +562,43 @@ static int pv_get_dlg_count(
 }
 
 
+static void warn_dmq_load_callback_modules(void)
+{
+	int acc_loaded;
+	int call_control_loaded;
+	int peerstate_loaded;
+	int pua_dialoginfo_loaded;
+	int uac_loaded;
+
+	if(dlg_dmq_load_callbacks == 0)
+		return;
+
+	acc_loaded = module_loaded("acc");
+	call_control_loaded = module_loaded("call_control");
+	peerstate_loaded = module_loaded("peerstate");
+	pua_dialoginfo_loaded = module_loaded("pua_dialoginfo");
+	uac_loaded = module_loaded("uac");
+
+	if(acc_loaded || call_control_loaded || peerstate_loaded
+			|| pua_dialoginfo_loaded || uac_loaded) {
+		LM_WARN("dmq_load_callbacks is enabled; loaded modules with "
+				"known DLGCB_LOADED behavior:%s%s%s%s%s. Review their effects "
+				"on dialogs created from DMQ\n",
+				acc_loaded ? " acc" : "",
+				call_control_loaded ? " call_control" : "",
+				peerstate_loaded ? " peerstate" : "",
+				pua_dialoginfo_loaded ? " pua_dialoginfo" : "",
+				uac_loaded ? " uac" : "");
+	}
+}
+
+
 static int mod_init(void)
 {
 	unsigned int n;
 	sr_cfgenv_t *cenv = NULL;
+
+	warn_dmq_load_callback_modules();
 
 	if(dlg_h_id_start == -1) {
 		dlg_h_id_start = server_id;
@@ -792,6 +847,10 @@ static int mod_init(void)
 
 	if(_dlg_track_cseq_updates != 0) {
 		cenv = sr_cfgenv_get();
+		if(cenv->cb_cseq_update != NULL) {
+			LM_ERR("a CSeq update tracker is already registered\n");
+			return -1;
+		}
 		cenv->cb_cseq_update = dlg_cseq_update;
 		dlg_register_cseq_callbacks();
 	}
@@ -2808,8 +2867,8 @@ static int ki_dlg_var_is_null(sip_msg_t *msg, str *name)
 /**
  *
  */
-static int ki_dlg_req_within4(struct sip_msg *msg, str *side, str *method,
-		str *content_type, str *content)
+static int ki_dlg_req_within5(struct sip_msg *msg, str *side, str *method,
+		str *headers, str *content_type, str *content)
 {
 	int n = 0;
 	if(side && side->len > 0) {
@@ -2823,7 +2882,33 @@ static int ki_dlg_req_within4(struct sip_msg *msg, str *side, str *method,
 	}
 
 	return ki_dlg_req_with_headers_and_content(
-			msg, n, method, NULL, content_type, content);
+			msg, n, method, headers, content_type, content);
+}
+
+/**
+ *
+ */
+static int ki_dlg_req_within4(struct sip_msg *msg, str *side, str *method,
+		str *content_type, str *content)
+{
+	return ki_dlg_req_within5(msg, side, method, NULL, content_type, content);
+}
+
+/**
+ *
+ */
+static int ki_dlg_req_within3(
+		struct sip_msg *msg, str *side, str *method, str *headers)
+{
+	return ki_dlg_req_within5(msg, side, method, headers, NULL, NULL);
+}
+
+/**
+ *
+ */
+static int ki_dlg_req_within2(struct sip_msg *msg, str *side, str *method)
+{
+	return ki_dlg_req_within5(msg, side, method, NULL, NULL, NULL);
 }
 
 /**
@@ -2856,6 +2941,11 @@ static sr_kemi_t sr_kemi_dialog_exports[] = {
 		{ SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
+	{ str_init("dialog"), str_init("dlg_remove_dialogs_from_node"),
+		SR_KEMIP_INT, ki_dlg_remove_dialogs_from_node,
+		{ SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
 	{ str_init("dialog"), str_init("dlg_set_timeout"),
 		SR_KEMIP_INT, ki_dlg_set_timeout,
 		{ SR_KEMIP_INT, SR_KEMIP_NONE, SR_KEMIP_NONE,
@@ -2869,6 +2959,16 @@ static sr_kemi_t sr_kemi_dialog_exports[] = {
 	{ str_init("dialog"), str_init("dlg_set_property"),
 		SR_KEMIP_INT, ki_dlg_set_property,
 		{ SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("dialog"), str_init("dlg_update_contact"),
+		SR_KEMIP_INT, ki_dlg_update_contact,
+		{ SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("dialog"), str_init("dlg_update_socket"),
+		SR_KEMIP_INT, ki_dlg_update_socket,
+		{ SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
 	{ str_init("dialog"), str_init("dlg_reset_property"),
@@ -3001,10 +3101,25 @@ static sr_kemi_t sr_kemi_dialog_exports[] = {
 		{ SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
+	{ str_init("dialog"), str_init("dlg_req_within2"),
+		SR_KEMIP_INT, ki_dlg_req_within2,
+		{ SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("dialog"), str_init("dlg_req_within3"),
+		SR_KEMIP_INT, ki_dlg_req_within3,
+		{ SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
 	{ str_init("dialog"), str_init("dlg_req_within4"),
 		SR_KEMIP_INT, ki_dlg_req_within4,
 		{ SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR,
 			SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("dialog"), str_init("dlg_req_within5"),
+		SR_KEMIP_INT, ki_dlg_req_within5,
+		{ SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR,
+			SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_NONE }
 	},
 
 	{ {0, 0}, {0, 0}, 0, NULL, { 0, 0, 0, 0, 0, 0 } }
@@ -3420,9 +3535,114 @@ static int w_is_known_dlg(sip_msg_t *msg)
 	return is_known_dlg(msg);
 }
 
+static int w_dlg_remove_dialogs_from_node(
+		struct sip_msg *msg, char *uri, char *s2)
+{
+	str val;
+
+	if(fixup_get_svalue(msg, (gparam_t *)uri, &val) != 0) {
+		LM_ERR("no node_uri value\n");
+		return -1;
+	}
+
+	return ki_dlg_remove_dialogs_from_node(msg, &val);
+}
+
 static int w_dlg_set_ruri(sip_msg_t *msg, char *p1, char *p2)
 {
 	return dlg_set_ruri(msg);
+}
+
+/**
+ * Update the stored contact of the current dialog leg from the message's
+ * Contact header.
+ */
+static int ki_dlg_update_contact(sip_msg_t *msg)
+{
+	dlg_cell_t *dlg = NULL;
+	unsigned int dir = 0;
+	str contact = STR_NULL;
+	contact_body_t *cb = NULL;
+	int leg;
+	int ret = 1;
+
+	dlg = dlg_lookup_msg_dialog(msg, &dir);
+	if(dlg == NULL) {
+		LM_DBG("no dialog for this message - contact not updated\n");
+		return -1;
+	}
+
+	if(parse_headers(msg, HDR_CONTACT_F, 0) < 0 || msg->contact == NULL) {
+		LM_DBG("no contact header - nothing to update\n");
+		dlg_release(dlg);
+		return -1;
+	}
+	if(parse_contact(msg->contact) < 0) {
+		LM_DBG("bad contact header - contact not updated\n");
+		dlg_release(dlg);
+		return -1;
+	}
+	cb = (contact_body_t *)msg->contact->parsed;
+	if(cb == NULL || cb->contacts == NULL || cb->contacts->next != NULL) {
+		LM_DBG("no usable contact - contact not updated\n");
+		dlg_release(dlg);
+		return -1;
+	}
+	contact = cb->contacts->uri;
+
+	/* leg direction is reversed for replies vs requests */
+	if(msg->first_line.type == SIP_REPLY) {
+		leg = (dir == DLG_DIR_UPSTREAM) ? DLG_CALLER_LEG : DLG_CALLEE_LEG;
+	} else {
+		leg = (dir == DLG_DIR_UPSTREAM) ? DLG_CALLEE_LEG : DLG_CALLER_LEG;
+	}
+	if(contact.len <= 0 || dlg_update_contact(dlg, leg, &contact) != 0) {
+		ret = -1;
+	}
+	dlg_release(dlg);
+	return ret;
+}
+
+static int w_dlg_update_contact(sip_msg_t *msg, char *p1, char *p2)
+{
+	return ki_dlg_update_contact(msg);
+}
+
+/**
+ * Update the stored leg socket (bind_addr) of the current dialog from the
+ * receive socket of this message
+ */
+static int ki_dlg_update_socket(sip_msg_t *msg)
+{
+	dlg_cell_t *dlg = NULL;
+	unsigned int dir = 0;
+	int leg;
+
+	if(msg->rcv.bind_address == NULL) {
+		LM_DBG("no receive socket - leg socket not updated\n");
+		return -1;
+	}
+
+	dlg = dlg_lookup_msg_dialog(msg, &dir);
+	if(dlg == NULL) {
+		LM_DBG("no dialog for this message - leg socket not updated\n");
+		return -1;
+	}
+
+	/* leg direction is reversed for replies vs requests */
+	if(msg->first_line.type == SIP_REPLY) {
+		leg = (dir == DLG_DIR_UPSTREAM) ? DLG_CALLER_LEG : DLG_CALLEE_LEG;
+	} else {
+		leg = (dir == DLG_DIR_UPSTREAM) ? DLG_CALLEE_LEG : DLG_CALLER_LEG;
+	}
+	dlg->bind_addr[leg] = msg->rcv.bind_address;
+	dlg_release(dlg);
+	return 1;
+}
+
+static int w_dlg_update_socket(sip_msg_t *msg, char *p1, char *p2)
+{
+	return ki_dlg_update_socket(msg);
 }
 
 static const char *rpc_print_dlgs_doc[2] = {"Print all dialogs", 0};
@@ -3565,6 +3785,7 @@ static void rpc_dlg_set_state(rpc_t *rpc, void *c)
 	/* setting new state for this dialog */
 	ostate = dlg->state;
 	dlg->state = sval;
+	dlg->last_modified = ksr_time_uint(NULL, NULL);
 
 	/* updates for terminated dialogs */
 	if(ostate == DLG_STATE_CONFIRMED && sval == DLG_STATE_DELETED) {

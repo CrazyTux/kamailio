@@ -88,6 +88,8 @@ int _tps_param_mask_callid = 0;
 int _tps_sanity_checks = 0;
 int _tps_rr_update = 0;
 int _tps_header_mode = 0;
+int _tps_sn_refresh_topology = 0;
+int _tps_dlg_mode = 0;
 str _tps_storage = str_init("db");
 str _tps_methods_update_time_list = str_init("SUBSCRIBE");
 
@@ -189,6 +191,8 @@ static param_export_t params[] = {
 	{"xavu_field_a_contact_host", PARAM_STR, &_tps_xavu_field_acontact_host},
 	{"xavu_field_b_contact_host", PARAM_STR, &_tps_xavu_field_bcontact_host},
 	{"rr_update", PARAM_INT, &_tps_rr_update},
+	{"sn_refresh_topology", PARAM_INT, &_tps_sn_refresh_topology},
+	{"dlg_mode", PARAM_INT, &_tps_dlg_mode},
 	{"context", PARAM_STR, &_tps_context_param},
 	{"methods_nocontact", PARAM_STR, &_tps_methods_nocontact_list},
 	{"methods_noinitial", PARAM_STR, &_tps_methods_noinitial_list},
@@ -342,10 +346,11 @@ static int mod_init(void)
 		return -1;
 	}
 
-	if(_tps_contact_mode == TPS_CONTACT_MODE_XAVPHOST
+	if((_tps_contact_mode == TPS_CONTACT_MODE_XAVPHOST
+			   || _tps_contact_mode == TPS_CONTACT_MODE_XAVPHOSTONLY)
 			&& (_tps_xavu_cfg.len <= 0 || _tps_xavu_field_acontact_host.len <= 0
 					|| _tps_xavu_field_bcontact_host.len <= 0)) {
-		LM_ERR("contact_mode parameter is 3,"
+		LM_ERR("contact_mode parameter is 3 or 4,"
 			   " but a_contact_host or b_contact_host xavu fields not "
 			   "defined\n");
 		return -1;
@@ -540,6 +545,7 @@ int tps_msg_received(sr_event_param_t *evp)
 	char *nbuf = NULL;
 	int dialog;
 	int ret;
+	int nstrip = 0;
 
 	ki_tps_set_context(NULL, NULL);
 
@@ -563,13 +569,27 @@ int tps_msg_received(sr_event_param_t *evp)
 		goto done;
 	}
 
+	/* Remove any bogus pre-existing headers that topos uses internally */
+	nstrip = tps_remove_internal_headers(&msg);
+	if(nstrip < 0) {
+		/* drop the entire SIP message if issues with topos internal header remove */
+		obuf->len = 0;
+		goto done;
+	}
+
 	if(tps_skip_msg(&msg)) {
+		if(nstrip > 0) {
+			goto update;
+		}
 		goto done;
 	}
 
 	if(tps_execute_event_route(&msg, evp, TPS_EVENTRT_RECEIVING,
 			   _tps_eventrt_receiving, &_tps_eventrt_receiving_name)
 			== 1) {
+		if(nstrip > 0) {
+			goto update;
+		}
 		goto done;
 	}
 
@@ -577,6 +597,9 @@ int tps_msg_received(sr_event_param_t *evp)
 		if(_tps_sanity_checks != 0) {
 			if(_tps_scb.check_defaults(&msg) < 1) {
 				LM_ERR("sanity checks failed\n");
+				if(nstrip > 0) {
+					goto update;
+				}
 				goto done;
 			}
 		}
@@ -590,6 +613,7 @@ int tps_msg_received(sr_event_param_t *evp)
 		tps_response_received(&msg);
 	}
 
+update:
 	nbuf = tps_msg_update(&msg, (unsigned int *)&obuf->len);
 
 	if(nbuf == NULL) {
@@ -719,7 +743,9 @@ static int tps_execute_event_route(sip_msg_t *msg, sr_event_param_t *evp,
 {
 	sip_msg_t *fmsg = NULL;
 	struct run_act_ctx ctx;
-	int rtb;
+	int rtb = 0;
+	int ret = 0;
+	int route_set = 0;
 	sr_kemi_eng_t *keng = NULL;
 	onsend_info_t onsnd_info = {0};
 	onsend_info_t *p_onsend_bak = 0;
@@ -771,6 +797,7 @@ static int tps_execute_event_route(sip_msg_t *msg, sr_event_param_t *evp,
 
 	rtb = get_route_type();
 	set_route_type(REQUEST_ROUTE);
+	route_set = 1;
 	init_run_actions_ctx(&ctx);
 	if(evidx >= 0) {
 		run_top_route(event_rt.rlist[evidx], (msg) ? msg : fmsg, &ctx);
@@ -780,28 +807,25 @@ static int tps_execute_event_route(sip_msg_t *msg, sr_event_param_t *evp,
 					   &_tps_eventrt_callback, evname)
 					< 0) {
 				LM_ERR("error running event route kemi callback\n");
-				p_onsend = p_onsend_bak;
-				if(fmsg != NULL && evp->rcv != NULL) {
-					fmsg->rcv = fmsg_rcv_bak;
-				}
-				return -1;
+				ret = -1;
+				goto done;
 			}
 		}
+	}
+	if(ctx.run_flags & DROP_R_F) {
+		LM_DBG("exit due to 'drop' in event route\n");
+		ret = 1;
+	}
+
+done:
+	if(route_set) {
+		set_route_type(rtb);
 	}
 	if(fmsg != NULL && evp->rcv != NULL) {
 		fmsg->rcv = fmsg_rcv_bak;
 	}
-
-	set_route_type(rtb);
-	if(ctx.run_flags & DROP_R_F) {
-		LM_DBG("exit due to 'drop' in event route\n");
-		p_onsend = p_onsend_bak;
-		return 1;
-	}
-
-done:
 	p_onsend = p_onsend_bak;
-	return 0;
+	return ret;
 }
 
 /**

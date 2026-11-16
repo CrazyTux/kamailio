@@ -126,11 +126,15 @@ int dlgs_sipfields_get(sip_msg_t *msg, dlgs_sipfields_t *sf)
 	return 0;
 }
 
+#define DLGS_ITEM_SIZE_MAX (1 << 16)
+
 dlgs_item_t *dlgs_item_new(sip_msg_t *msg, dlgs_sipfields_t *sf, str *src,
 		str *dst, str *data, unsigned int hashid)
 {
 	dlgs_item_t *item;
-	unsigned int msize;
+	size_t msize;
+	size_t payload_size;
+	size_t ttag_space;
 	str ruid = STR_NULL;
 	char ruidbuf[SRUID_SIZE + 16];
 
@@ -150,13 +154,56 @@ dlgs_item_t *dlgs_item_new(sip_msg_t *msg, dlgs_sipfields_t *sf, str *src,
 	}
 	ruid.s = ruidbuf;
 
-	msize = sizeof(dlgs_item_t)
-			+ (sf->callid.len + 1 + sf->ftag.len + 1
-					  + ((sf->ttag.len > 0) ? (sf->ttag.len + 1)
-											: DLGS_TOTAG_SIZE)
-					  + ruid.len + 1 + dst->len + 1 + src->len + 1 + data->len
-					  + 1 + sf->branch.len + 1)
-					  * sizeof(char);
+	if(sf->callid.len < 0 || sf->ftag.len < 0 || sf->ttag.len < 0
+			|| sf->branch.len < 0 || src == NULL || src->len < 0 || dst == NULL
+			|| dst->len < 0 || data == NULL || data->len < 0 || ruid.len < 0) {
+		LM_ERR("invalid negative length while building dlg item\n");
+		return NULL;
+	}
+
+	ttag_space =
+			(sf->ttag.len > 0) ? (size_t)sf->ttag.len + 1 : DLGS_TOTAG_SIZE;
+	payload_size = (size_t)sf->callid.len + 1;
+	if(payload_size > DLGS_ITEM_SIZE_MAX - ((size_t)sf->ftag.len + 1)) {
+		LM_ERR("dlg item size overflow\n");
+		return NULL;
+	}
+	payload_size += (size_t)sf->ftag.len + 1;
+	if(payload_size > DLGS_ITEM_SIZE_MAX - ttag_space) {
+		LM_ERR("dlg item size overflow\n");
+		return NULL;
+	}
+	payload_size += ttag_space;
+	if(payload_size > DLGS_ITEM_SIZE_MAX - ((size_t)ruid.len + 1)) {
+		LM_ERR("dlg item size overflow\n");
+		return NULL;
+	}
+	payload_size += (size_t)ruid.len + 1;
+	if(payload_size > DLGS_ITEM_SIZE_MAX - ((size_t)dst->len + 1)) {
+		LM_ERR("dlg item size overflow\n");
+		return NULL;
+	}
+	payload_size += (size_t)dst->len + 1;
+	if(payload_size > DLGS_ITEM_SIZE_MAX - ((size_t)src->len + 1)) {
+		LM_ERR("dlg item size overflow\n");
+		return NULL;
+	}
+	payload_size += (size_t)src->len + 1;
+	if(payload_size > DLGS_ITEM_SIZE_MAX - ((size_t)data->len + 1)) {
+		LM_ERR("dlg item size overflow\n");
+		return NULL;
+	}
+	payload_size += (size_t)data->len + 1;
+	if(payload_size > DLGS_ITEM_SIZE_MAX - ((size_t)sf->branch.len + 1)) {
+		LM_ERR("dlg item size overflow\n");
+		return NULL;
+	}
+	payload_size += (size_t)sf->branch.len + 1;
+	if(payload_size > DLGS_ITEM_SIZE_MAX - sizeof(dlgs_item_t)) {
+		LM_ERR("dlg item size overflow\n");
+		return NULL;
+	}
+	msize = sizeof(dlgs_item_t) + payload_size;
 
 	item = (dlgs_item_t *)shm_malloc(msize);
 	if(item == NULL) {
@@ -641,6 +688,8 @@ int dlgs_count(sip_msg_t *msg, str *vfield, str *vop, str *vdata)
 	dlgs_item_t *it;
 	int tfield = 0;
 	int top = 0;
+	regex_t mre;
+	void *rdata = NULL;
 
 	if(_dlgs_htb == NULL) {
 		return -1;
@@ -657,6 +706,16 @@ int dlgs_count(sip_msg_t *msg, str *vfield, str *vop, str *vdata)
 		return -1;
 	}
 
+	if(top == 2) {
+		memset(&mre, 0, sizeof(regex_t));
+		if(regcomp(&mre, vdata->s, REG_EXTENDED | REG_ICASE | REG_NEWLINE)
+				!= 0) {
+			LM_ERR("failed to compile regex: %.*s\n", vdata->len, vdata->s);
+			return -1;
+		}
+		rdata = &mre;
+	}
+
 	n = 0;
 	if(tfield == 0) {
 		/* count 'any' dialog not-yet-finished */
@@ -666,6 +725,8 @@ int dlgs_count(sip_msg_t *msg, str *vfield, str *vop, str *vdata)
 			n += _dlgs_htb->slots[i].astats.c_answered;
 			n += _dlgs_htb->slots[i].astats.c_confirmed;
 		}
+		if(top == 2)
+			regfree(&mre);
 		return n;
 	}
 
@@ -674,13 +735,15 @@ int dlgs_count(sip_msg_t *msg, str *vfield, str *vop, str *vdata)
 		for(it = _dlgs_htb->slots[i].first; it != NULL; it = it->next) {
 			if(it->state != DLGS_STATE_TERMINATED
 					&& it->state != DLGS_STATE_NOTANSWERED) {
-				if(dlgs_match_field(it, tfield, top, vdata, NULL) == 0) {
+				if(dlgs_match_field(it, tfield, top, vdata, rdata) == 0) {
 					n++;
 				}
 			}
 		}
 		lock_release(&_dlgs_htb->slots[i].lock);
 	}
+	if(top == 2)
+		regfree(&mre);
 
 	return n;
 }
@@ -741,6 +804,37 @@ void dlgs_update_stats(dlgs_stats_t *stats, int state, int val)
 		case DLGS_STATE_NOTANSWERED:
 			stats->c_notanswered += val;
 			return;
+	}
+}
+
+/**
+ * Fill aggregated active and/or final stats from internal tracking.
+ */
+void dlgs_get_stats(dlgs_stats_t *astats, dlgs_stats_t *fstats)
+{
+	unsigned int i;
+
+	if(astats != NULL) {
+		memset(astats, 0, sizeof(dlgs_stats_t));
+	}
+	if(fstats != NULL) {
+		memset(fstats, 0, sizeof(dlgs_stats_t));
+	}
+	if(_dlgs_htb == NULL) {
+		return;
+	}
+	if(fstats != NULL) {
+		*fstats = _dlgs_htb->fstats;
+	}
+	if(astats != NULL) {
+		for(i = 0; i < _dlgs_htb->htsize; i++) {
+			astats->c_init += _dlgs_htb->slots[i].astats.c_init;
+			astats->c_progress += _dlgs_htb->slots[i].astats.c_progress;
+			astats->c_answered += _dlgs_htb->slots[i].astats.c_answered;
+			astats->c_confirmed += _dlgs_htb->slots[i].astats.c_confirmed;
+			astats->c_terminated += _dlgs_htb->slots[i].astats.c_terminated;
+			astats->c_notanswered += _dlgs_htb->slots[i].astats.c_notanswered;
+		}
 	}
 }
 
@@ -871,6 +965,21 @@ done:
 	dlgs_unlock_item(msg);
 	LM_DBG("old state %d - new state %d\n", ostate, nstate);
 	return 0;
+}
+
+/**
+ *
+ */
+int dlgs_find_item(sip_msg_t *msg)
+{
+	dlgs_item_t *it;
+
+	it = dlgs_get_item(msg);
+	if(it == NULL) {
+		return -1;
+	}
+	dlgs_unlock_item(msg);
+	return 1;
 }
 
 /**
@@ -1065,6 +1174,7 @@ static void dlgs_rpc_stats(rpc_t *rpc, void *ctx)
 	void *ti;
 	dlgs_stats_t *sti;
 	dlgs_stats_t sta;
+	dlgs_stats_t stf;
 	int i;
 
 	if(_dlgs_htb == NULL) {
@@ -1075,30 +1185,21 @@ static void dlgs_rpc_stats(rpc_t *rpc, void *ctx)
 		rpc->fault(ctx, 500, "Internal error creating rpc");
 		return;
 	}
+	dlgs_get_stats(&sta, &stf);
 	i = 0;
 	do {
 		if(i == 0) {
-			sti = &_dlgs_htb->fstats;
+			sti = &stf;
 			if(rpc->struct_add(th, "{", "final", &ti) < 0) {
 				rpc->fault(ctx, 500, "Internal error creating final stats");
 				return;
 			}
 		} else {
-			memset(&sta, 0, sizeof(dlgs_stats_t));
-			for(i = 0; i < _dlgs_htb->htsize; i++) {
-				sta.c_init += _dlgs_htb->slots[i].astats.c_init;
-				sta.c_progress += _dlgs_htb->slots[i].astats.c_progress;
-				sta.c_answered += _dlgs_htb->slots[i].astats.c_answered;
-				sta.c_confirmed += _dlgs_htb->slots[i].astats.c_confirmed;
-				sta.c_terminated += _dlgs_htb->slots[i].astats.c_terminated;
-				sta.c_notanswered += _dlgs_htb->slots[i].astats.c_notanswered;
-			}
 			sti = &sta;
 			if(rpc->struct_add(th, "{", "active", &ti) < 0) {
-				rpc->fault(ctx, 500, "Internal error creating final stats");
+				rpc->fault(ctx, 500, "Internal error creating active stats");
 				return;
 			}
-			i = 1;
 		}
 		if(rpc->struct_add(ti, "uuuuuu", "init", sti->c_init, "progress",
 				   sti->c_progress, "answered", sti->c_answered, "confirmed",

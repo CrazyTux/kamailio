@@ -409,12 +409,13 @@ static int xhttp_send_reply(
 		memcpy(tbuf.s + sizeof("Content-Type: ") - 1, ctype->s, ctype->len);
 		memcpy(tbuf.s + sizeof("Content-Type: ") - 1 + ctype->len, CRLF,
 				CRLF_LEN);
-		if(add_lump_rpl(msg, tbuf.s, tbuf.len, LUMP_RPL_HDR) == 0) {
+		if(add_lump_rpl(msg, tbuf.s, tbuf.len, LUMP_RPL_HDR | LUMP_RPL_NODUP)
+				== 0) {
 			LM_ERR("failed to insert content-type lump\n");
 			pkg_free(tbuf.s);
 			return -1;
 		}
-		pkg_free(tbuf.s);
+		tbuf.s = NULL;
 		LM_DBG("response with content-type: %.*s\n", ctype->len, ctype->s);
 	}
 

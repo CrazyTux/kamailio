@@ -74,6 +74,7 @@ struct cfg_group_core
 	int dns_retr_no;
 	int dns_servers_no;
 	int dns_search_list;
+	int dns_query_absolute;
 	int dns_search_fmatch;
 	int dns_reinit;
 	int dns_naptr_ignore_rfc;
@@ -89,6 +90,7 @@ struct cfg_group_core
 	unsigned int dns_cache_max_mem;
 	int dns_cache_del_nonexp;
 	int dns_cache_rec_pref;
+	int dns_cache_mode;
 #endif
 #ifdef PKG_MALLOC
 	int mem_dump_pkg;

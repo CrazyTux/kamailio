@@ -21,9 +21,9 @@
 
 /*!
  * \file
- * \brief Kamailio topoh ::
- * \ingroup topoh
- * Module: \ref topoh
+ * \brief Kamailio topos ::
+ * \ingroup topos
+ * Module: \ref topos
  */
 
 #ifndef _TOPOS_MSG_H_
@@ -45,4 +45,6 @@ int tps_request_sent(sip_msg_t *msg, int dialog, int local);
 int tps_response_sent(sip_msg_t *msg);
 int tps_mask_callid(sip_msg_t *msg);
 int tps_unmask_callid(sip_msg_t *msg);
+int tps_get_param_value(str *in, str *name, str *value);
+int tps_remove_internal_headers(sip_msg_t *msg);
 #endif

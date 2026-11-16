@@ -41,6 +41,7 @@
 #define TPS_CONTACT_MODE_RURIUSER 1
 #define TPS_CONTACT_MODE_XAVPUSER 2
 #define TPS_CONTACT_MODE_XAVPHOST 3
+#define TPS_CONTACT_MODE_XAVPHOSTONLY 4
 
 
 #define TPS_DBU_CONTACT (1 << 0)
@@ -48,6 +49,8 @@
 #define TPS_DBU_ARR (1 << 2)
 #define TPS_DBU_BRR (1 << 3)
 #define TPS_DBU_TIME (1 << 4)
+#define TPS_DBU_SRR (1 << 5)
+#define TPS_DBU_SCONTACT (1 << 6)
 #define TPS_DBU_ALL (0xffffffff)
 
 #define TPS_DATA_SIZE 16384

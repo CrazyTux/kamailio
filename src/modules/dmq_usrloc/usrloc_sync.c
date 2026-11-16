@@ -44,7 +44,7 @@ dmq_api_t usrloc_dmqb;
 dmq_peer_t *usrloc_dmq_peer = NULL;
 
 int usrloc_dmq_send_all();
-int usrloc_dmq_request_sync();
+int usrloc_dmq_request_sync(dmq_node_t *node);
 int usrloc_dmq_send_contact(
 		ucontact_t *ptr, str aor, int action, dmq_node_t *node);
 int usrloc_dmq_send_multi_contact(
@@ -65,6 +65,7 @@ extern int _dmq_usrloc_batch_msg_size;
 extern int _dmq_usrloc_batch_size;
 extern int _dmq_usrloc_batch_usleep;
 extern str _dmq_usrloc_domain;
+extern str _dmq_usrloc_peer_id;
 extern int _dmq_usrloc_delete;
 extern int _dmq_usrloc_delete_expired;
 
@@ -90,6 +91,18 @@ static int add_contact(str aor, ucontact_info_t *ci)
 		res = dmq_ul.get_urecord_by_ruid(
 				_d, dmq_ul.get_aorhash(&aor), &ci->ruid, &r, &c);
 		if(res == 0) {
+			/* LWW: skip update if local contact is newer */
+			if(ci->last_modified > 0 && c->last_modified > ci->last_modified) {
+				LM_DBG("LWW: skipping stale update for contact=[%.*s] "
+					   "ruid=[%.*s] "
+					   "local=%u incoming=%u\n",
+						c->c.len, c->c.s, c->ruid.len, c->ruid.s,
+						(unsigned int)c->last_modified,
+						(unsigned int)ci->last_modified);
+				dmq_ul.release_urecord(r);
+				dmq_ul.unlock_udomain(_d, &aor);
+				return 0;
+			}
 			LM_DBG("Found contact\n");
 			dmq_ul.update_ucontact(r, c, ci);
 			LM_DBG("Release record\n");
@@ -115,8 +128,18 @@ static int add_contact(str aor, ucontact_info_t *ci)
 			contact.len = ci->c->len;
 			dmq_ul.insert_ucontact(r, &contact, ci, &c);
 		} else if(res == 0) {
-			LM_DBG("Found contact\n");
-			dmq_ul.update_ucontact(r, c, ci);
+			/* LWW: skip update if local contact is newer */
+			if(ci->last_modified > 0 && c->last_modified > ci->last_modified) {
+				LM_DBG("LWW: skipping stale update for contact=[%.*s] "
+					   "ruid=[%.*s] "
+					   "local=%u incoming=%u\n",
+						c->c.len, c->c.s, c->ruid.len, c->ruid.s,
+						(unsigned int)c->last_modified,
+						(unsigned int)ci->last_modified);
+			} else {
+				LM_DBG("Found contact\n");
+				dmq_ul.update_ucontact(r, c, ci);
+			}
 		}
 	} else {
 		LM_DBG("'%.*s' Not found in usrloc\n", aor.len, ZSW(aor.s));
@@ -161,6 +184,17 @@ static int delete_contact(str aor, ucontact_info_t *ci)
 			!= 0) {
 		LM_DBG("AOR/Contact [%.*s] not found\n", aor.len, aor.s);
 		return -1;
+	}
+	/* LWW: skip delete if local contact is newer */
+	if(ci->last_modified > 0 && c->last_modified > ci->last_modified) {
+		LM_DBG("LWW: skipping stale delete for contact=[%.*s] ruid=[%.*s] "
+			   "local=%u incoming=%u\n",
+				c->c.len, c->c.s, c->ruid.len, c->ruid.s,
+				(unsigned int)c->last_modified,
+				(unsigned int)ci->last_modified);
+		dmq_ul.release_urecord(r);
+		dmq_ul.unlock_udomain(_d, &aor);
+		return 0;
 	}
 	if(dmq_ul.delete_ucontact(r, c) != 0) {
 		dmq_ul.unlock_udomain(_d, &aor);
@@ -303,10 +337,8 @@ int usrloc_dmq_initialize()
 	}
 	not_peer.callback = usrloc_dmq_handle_msg;
 	not_peer.init_callback = usrloc_dmq_request_sync;
-	not_peer.description.s = "usrloc";
-	not_peer.description.len = 6;
-	not_peer.peer_id.s = "usrloc";
-	not_peer.peer_id.len = 6;
+	not_peer.peer_id = _dmq_usrloc_peer_id;
+	not_peer.description = _dmq_usrloc_peer_id;
 	usrloc_dmq_peer = usrloc_dmqb.register_dmq_peer(&not_peer);
 	if(!usrloc_dmq_peer) {
 		LM_ERR("error in register_dmq_peer\n");
@@ -552,10 +584,7 @@ int usrloc_dmq_handle_msg(
 		goto invalid;
 	}
 
-	body.s = get_body(msg);
-	body.len = content_length;
-
-	if(!body.s) {
+	if(get_body_str(msg, &body) < 0) {
 		LM_ERR("unable to get body\n");
 		goto error;
 	}
@@ -605,7 +634,7 @@ error:
 }
 
 
-int usrloc_dmq_request_sync()
+int usrloc_dmq_request_sync(dmq_node_t *node)
 {
 	srjson_doc_t jdoc;
 
@@ -629,7 +658,7 @@ int usrloc_dmq_request_sync()
 	}
 	jdoc.buf.len = strlen(jdoc.buf.s);
 	LM_DBG("sending serialized data %.*s\n", jdoc.buf.len, jdoc.buf.s);
-	if(usrloc_dmq_send(&jdoc.buf, 0) != 0) {
+	if(usrloc_dmq_send(&jdoc.buf, node) != 0) {
 		goto error;
 	}
 

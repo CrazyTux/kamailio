@@ -29,6 +29,7 @@
 
 #include <string.h>
 #include "parse_date.h"
+#include "parse_bytes.h"
 #include "parse_def.h"
 #include "parser_f.h" /* eat_space_end and so on */
 #include "../mem/mem.h"
@@ -37,14 +38,20 @@
  * Parse Date header field
  */
 
-#define READ(val) \
-	(*(val + 0) + (*(val + 1) << 8) + (*(val + 2) << 16) + (*(val + 3) << 24))
-
 inline static int char2int(char *p, int *t)
 {
 	if(*p < '0' || *p > '9' || *(p + 1) < '0' || *(p + 1) > '9')
 		return -1;
 	*t = (*p - '0') * 10 + *(p + 1) - '0';
+
+	return 0;
+}
+
+inline static int onechar2int(char *p, int *t)
+{
+	if(*p < '0' || *p > '9')
+		return -1;
+	*t = *p - '0';
 
 	return 0;
 }
@@ -58,7 +65,7 @@ static int rfc1123totm(char *stime, struct tm *ttm)
 	unsigned int uval;
 	int ires;
 
-	uval = READ(ptime);
+	uval = ksr_read_u32le(ptime);
 	ptime += 4;
 	switch(uval) {
 		/* Sun, */
@@ -96,15 +103,20 @@ static int rfc1123totm(char *stime, struct tm *ttm)
 	if(*(ptime++) != ' ')
 		return -3;
 
-
-	if(char2int(ptime, &ttm->tm_mday) || ttm->tm_mday > 31)
-		return -4;
-	ptime += 2;
+	if(*(ptime + 1) == ' ') {
+		if(onechar2int(ptime, &ttm->tm_mday) || ttm->tm_mday > 9)
+			return -4;
+		ptime += 1;
+	} else {
+		if(char2int(ptime, &ttm->tm_mday) || ttm->tm_mday > 31)
+			return -4;
+		ptime += 2;
+	}
 
 	if(*(ptime++) != ' ')
 		return -5;
 
-	uval = READ(ptime);
+	uval = ksr_read_u32le(ptime);
 	ptime += 4;
 	switch(uval) {
 		/* Jan, */
@@ -187,8 +199,8 @@ static int rfc1123totm(char *stime, struct tm *ttm)
 	ptime += 2;
 
 	/* " GMT" */
-	uval = READ(ptime);
-	if((uval | 0x20202020) != 0x746d6720)
+	uval = ksr_read_u32le(ptime);
+	if(ksr_ascii_lower_u32(uval) != 0x746d6720)
 		return -15;
 
 	return 0;

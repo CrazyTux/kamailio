@@ -25,6 +25,7 @@
 #include "dlg_hash.h"
 #include "dlg_profile.h"
 #include "dlg_var.h"
+#include <time.h>
 
 static str dlg_dmq_content_type = str_init("application/json");
 static str dmq_200_rpl = str_init("OK");
@@ -35,9 +36,13 @@ dmq_api_t dlg_dmqb;
 dmq_peer_t *dlg_dmq_peer = NULL;
 
 int dmq_send_all_dlgs(dmq_node_t *dmq_node);
-int dlg_dmq_request_sync();
+int dlg_dmq_request_sync(dmq_node_t *dmq_node);
 
 extern int dlg_enable_stats;
+extern str dlg_dmq_peer_id;
+extern int dlg_dmq_ka_iflags_sync;
+extern int dlg_dmq_timeout_iflags_sync;
+extern int dlg_dmq_load_callbacks;
 
 /**
 * @brief add notification peer
@@ -56,10 +61,8 @@ int dlg_dmq_initialize()
 
 	not_peer.callback = dlg_dmq_handle_msg;
 	not_peer.init_callback = dlg_dmq_request_sync;
-	not_peer.description.s = "dialog";
-	not_peer.description.len = 6;
-	not_peer.peer_id.s = "dialog";
-	not_peer.peer_id.len = 6;
+	not_peer.peer_id = dlg_dmq_peer_id;
+	not_peer.description = dlg_dmq_peer_id;
 	dlg_dmq_peer = dlg_dmqb.register_dmq_peer(&not_peer);
 	if(!dlg_dmq_peer) {
 		LM_ERR("error in register_dmq_peer\n");
@@ -115,6 +118,9 @@ int dlg_dmq_handle_msg(
 		req_uri = {0, 0};
 	unsigned int init_ts = 0, start_ts = 0, lifetime = 0;
 	unsigned int state = 1;
+	unsigned int lm = 0;
+	unsigned int iflags = 0;
+	unsigned int iflags_mask = 0;
 	srjson_t *vj;
 	int newdlg = 0;
 	dlg_entry_t *d_entry = NULL;
@@ -132,12 +138,9 @@ int dlg_dmq_handle_msg(
 		goto invalid2;
 	}
 
-	body.s = get_body(msg);
-	body.len = content_length;
-
-	if(!body.s) {
+	if(get_body_str(msg, &body) < 0) {
 		LM_ERR("unable to get body\n");
-		goto error;
+		goto invalid2;
 	}
 
 	/* parse body */
@@ -174,6 +177,8 @@ int dlg_dmq_handle_msg(
 			state = SRJSON_GET_UINT(it);
 		} else if(strcmp(it->string, "lifetime") == 0) {
 			lifetime = SRJSON_GET_UINT(it);
+		} else if(strcmp(it->string, "iflags") == 0) {
+			iflags = SRJSON_GET_UINT(it);
 		} else if(strcmp(it->string, "callid") == 0) {
 			callid.s = it->valuestring;
 			callid.len = strlen(callid.s);
@@ -213,8 +218,10 @@ int dlg_dmq_handle_msg(
 		} else if(strcmp(it->string, "req_uri") == 0) {
 			req_uri.s = it->valuestring;
 			req_uri.len = strlen(req_uri.s);
+		} else if(strcmp(it->string, "last_modified") == 0) {
+			lm = SRJSON_GET_UINT(it);
 		} else {
-			LM_ERR("unrecognized field in json object\n");
+			LM_WARN("unrecognized field in json object: %s\n", it->string);
 		}
 	}
 
@@ -223,6 +230,18 @@ int dlg_dmq_handle_msg(
 		LM_DBG("found dialog [%u:%u] at %p\n", iuid.h_entry, iuid.h_id, dlg);
 		d_entry = &(d_table->entries[dlg->h_entry]);
 		unref++;
+
+		if(lm > 0 && dlg->last_modified > lm && action != DLG_DMQ_SYNC
+				&& action != DLG_DMQ_RM) {
+			/* LWW: skip if local dialog is newer */
+			LM_DBG("LWW: skipping stale action %d for dlg [%u:%u] "
+				   "local=%u incoming=%u\n",
+					action, iuid.h_entry, iuid.h_id, dlg->last_modified, lm);
+			goto skip;
+		}
+		if(lm > 0 && lm > dlg->last_modified) {
+			dlg->last_modified = lm;
+		}
 	}
 
 	switch(action) {
@@ -253,6 +272,22 @@ int dlg_dmq_handle_msg(
 				/* prevent DB sync */
 				dlg->dflags &= ~(DLG_FLAG_NEW | DLG_FLAG_CHANGED);
 				dlg->iflags |= DLG_IFLAG_DMQ_SYNC;
+				if(node && node->orig_uri.s && node->orig_uri.len > 0) {
+					dlg->dmq_node_uri.s =
+							(char *)shm_malloc(node->orig_uri.len + 1);
+					if(dlg->dmq_node_uri.s) {
+						memcpy(dlg->dmq_node_uri.s, node->orig_uri.s,
+								node->orig_uri.len);
+						dlg->dmq_node_uri.s[node->orig_uri.len] = '\0';
+						dlg->dmq_node_uri.len = node->orig_uri.len;
+					} else {
+						LM_ERR("no shm memory for dmq_node_uri\n");
+						dlg->dmq_node_uri.len = 0;
+					}
+				}
+				if(lm > 0) {
+					dlg->last_modified = lm;
+				}
 				newdlg = 1;
 			} else {
 				/* remove existing profiles */
@@ -264,6 +299,21 @@ int dlg_dmq_handle_msg(
 
 			dlg->init_ts = init_ts;
 			dlg->start_ts = start_ts;
+			/* lifetime from UPDATE, needed for UNCONFIRMED state of the dialog */
+			if(lifetime > 0)
+				dlg->lifetime = lifetime;
+
+			/* sync only the enabled internal flags from owner */
+			iflags_mask = 0;
+			if(dlg_dmq_ka_iflags_sync != 0) {
+				iflags_mask |= (DLG_IFLAG_KA_SRC | DLG_IFLAG_KA_DST);
+			}
+			if(dlg_dmq_timeout_iflags_sync != 0) {
+				iflags_mask |= DLG_IFLAG_TIMEOUTBYE;
+			}
+			if(iflags_mask != 0 && iflags > 0) {
+				dlg->iflags |= (iflags & iflags_mask);
+			}
 
 			vj = srjson_GetObjectItem(&jdoc, jdoc.root, "vars");
 			if(vj != NULL) {
@@ -299,6 +349,18 @@ int dlg_dmq_handle_msg(
 						dlg->state, state);
 				break;
 			}
+			if(action == DLG_DMQ_STATE) {
+				vj = srjson_GetObjectItem(&jdoc, jdoc.root, "vars");
+				if(vj != NULL) {
+					for(it = vj->child; it; it = it->next) {
+						k.s = it->string;
+						k.len = strlen(k.s);
+						v.s = it->valuestring;
+						v.len = strlen(v.s);
+						set_dlg_variable(dlg, &k, &v);
+					}
+				}
+			}
 			LM_DBG("State update dlg [%u:%u] with callid [%.*s] from state [%u]"
 				   " to state [%u]\n",
 					iuid.h_entry, iuid.h_id, dlg->callid.len, dlg->callid.s,
@@ -306,27 +368,44 @@ int dlg_dmq_handle_msg(
 			switch(state) {
 				case DLG_STATE_EARLY:
 					dlg->start_ts = start_ts;
-					dlg->lifetime = lifetime;
-					dlg_set_leg_info(
-							dlg, &tag1, &route_set1, &contact1, &cseq1, 0);
+					if(lifetime > 0)
+						dlg->lifetime = lifetime;
+					/* apply leg info if it carries data */
+					if(tag1.len > 0) {
+						dlg_set_leg_info(
+								dlg, &tag1, &route_set1, &contact1, &cseq1, 0);
+					}
 					break;
 				case DLG_STATE_CONFIRMED:
 					dlg->start_ts = start_ts;
-					dlg->lifetime = lifetime;
-					dlg_set_leg_info(
-							dlg, &tag1, &route_set1, &contact1, &cseq1, 0);
-					dlg_set_leg_info(
-							dlg, &tag2, &route_set2, &contact2, &cseq2, 1);
-					if(insert_dlg_timer(&dlg->tl, dlg->lifetime) != 0) {
+					if(lifetime > 0)
+						dlg->lifetime = lifetime;
+					/* apply leg info if it carries data */
+					if(tag1.len > 0) {
+						dlg_set_leg_info(
+								dlg, &tag1, &route_set1, &contact1, &cseq1, 0);
+					}
+					if(tag2.len > 0) {
+						dlg_set_leg_info(
+								dlg, &tag2, &route_set2, &contact2, &cseq2, 1);
+					}
+					ret = insert_dlg_timer(&dlg->tl, dlg->lifetime);
+					if(ret < 0) {
 						LM_CRIT("Unable to insert dlg timer %p [%u:%u]\n", dlg,
 								dlg->h_entry, dlg->h_id);
-					} else {
+					} else if(ret == 0) {
 						/* dialog pointer inserted in timer list */
 						dlg_ref(dlg, 1);
 					}
+					/* register keep-alive on the replicated CONFIRMED dialog */
+					if(dlg_dmq_ka_iflags_sync != 0
+							&& dlg->state != DLG_STATE_CONFIRMED) {
+						dlg_ka_add(dlg);
+					}
 					break;
 				case DLG_STATE_DELETED:
-					if(dlg->state == DLG_STATE_CONFIRMED) {
+					if(dlg->state == DLG_STATE_CONFIRMED_NA
+							|| dlg->state == DLG_STATE_CONFIRMED) {
 						ret = remove_dialog_timer(&dlg->tl);
 						if(ret == 0) {
 							/* one extra unref due to removal from timer list */
@@ -346,21 +425,41 @@ int dlg_dmq_handle_msg(
 
 					/* prevent DB sync */
 					dlg->dflags |= DLG_FLAG_NEW;
+					/* mark as deleted by a dmq peer */
+					dlg->dflags |= DLG_FLAG_DMQ_DELETED;
 					/* keep dialog around for a bit, to prevent out-of-order
 					 * syncs to reestablish the dlg */
 					dlg->init_ts = ksr_time_uint(NULL, NULL);
+					/* ensure end_ts is set so dlg_clean_run can clean the dialog */
+					if(dlg->end_ts == 0)
+						dlg->end_ts = ksr_time_uint(NULL, NULL);
+
+					if(dlg->state != DLG_STATE_DELETED) {
+						run_dlg_callbacks(DLGCB_TERMINATED, dlg, NULL, NULL,
+								DLG_DIR_NONE, 0);
+					}
+
 					break;
 				default:
 					LM_ERR("unhandled state update to state %u\n", state);
 					dlg_unref(dlg, unref);
 					goto error;
 			}
-			if(newdlg == 1) {
-				if(state == DLG_STATE_CONFIRMED_NA
-						|| state == DLG_STATE_CONFIRMED) {
-					if_update_stat(dlg_enable_stats, active_dlgs, 1);
-				} else if(dlg->state == DLG_STATE_EARLY) {
+			/* update node-local stats for the dlg dmq synced state transition */
+			if(dlg->state != state) {
+				if(dlg->state == DLG_STATE_EARLY) {
+					if_update_stat(dlg_enable_stats, early_dlgs, -1);
+				}
+				if(state == DLG_STATE_EARLY) {
 					if_update_stat(dlg_enable_stats, early_dlgs, 1);
+				} else if((state == DLG_STATE_CONFIRMED_NA
+								  || state == DLG_STATE_CONFIRMED)
+						  && dlg->state < DLG_STATE_CONFIRMED_NA) {
+					if_update_stat(dlg_enable_stats, active_dlgs, 1);
+				} else if(state == DLG_STATE_DELETED
+						  && (dlg->state == DLG_STATE_CONFIRMED_NA
+								  || dlg->state == DLG_STATE_CONFIRMED)) {
+					if_update_stat(dlg_enable_stats, active_dlgs, -1);
 				}
 			}
 			dlg->state = state;
@@ -374,7 +473,8 @@ int dlg_dmq_handle_msg(
 			LM_DBG("Removed dlg [%u:%u] with callid [%.*s] int state [%u]\n",
 					iuid.h_entry, iuid.h_id, dlg->callid.len, dlg->callid.s,
 					dlg->state);
-			if(dlg->state == DLG_STATE_CONFIRMED
+			if(dlg->state == DLG_STATE_CONFIRMED_NA
+					|| dlg->state == DLG_STATE_CONFIRMED
 					|| dlg->state == DLG_STATE_EARLY) {
 				ret = remove_dialog_timer(&dlg->tl);
 				if(ret == 0) {
@@ -385,8 +485,9 @@ int dlg_dmq_handle_msg(
 							dlg, dlg->h_entry, dlg->h_id);
 				}
 			}
-			if(state == DLG_STATE_CONFIRMED_NA
-					|| state == DLG_STATE_CONFIRMED) {
+			/* update node-local stats for the dlg dmq synced removal */
+			if(dlg->state == DLG_STATE_CONFIRMED_NA
+					|| dlg->state == DLG_STATE_CONFIRMED) {
 				if_update_stat(dlg_enable_stats, active_dlgs, -1);
 			} else if(dlg->state == DLG_STATE_EARLY) {
 				if_update_stat(dlg_enable_stats, early_dlgs, -1);
@@ -394,6 +495,15 @@ int dlg_dmq_handle_msg(
 			/* prevent DB sync */
 			dlg->dflags |= DLG_FLAG_NEW;
 			dlg->iflags &= ~DLG_IFLAG_DMQ_SYNC;
+			/* mark as deleted by a dmq peer */
+			dlg->dflags |= DLG_FLAG_DMQ_DELETED;
+
+			/* mark deleted if not already marked */
+			if(dlg->state != DLG_STATE_DELETED) {
+				dlg->state = DLG_STATE_DELETED;
+				if(dlg->end_ts == 0)
+					dlg->end_ts = ksr_time_uint(NULL, NULL);
+			}
 			unref++;
 			break;
 
@@ -404,6 +514,11 @@ int dlg_dmq_handle_msg(
 		case DLG_DMQ_NONE:
 			break;
 	}
+	if(newdlg && dlg->state != DLG_STATE_DELETED
+			&& dlg_dmq_load_callbacks != 0) {
+		run_dlg_load_callbacks(dlg);
+	}
+skip:
 	if(dlg) {
 		if(unref) {
 			dlg_unref(dlg, unref);
@@ -436,7 +551,7 @@ error:
 }
 
 
-int dlg_dmq_request_sync()
+int dlg_dmq_request_sync(dmq_node_t *dmq_node)
 {
 	srjson_doc_t jdoc;
 
@@ -458,7 +573,7 @@ int dlg_dmq_request_sync()
 	}
 	jdoc.buf.len = strlen(jdoc.buf.s);
 	LM_DBG("sending serialized data %.*s\n", jdoc.buf.len, jdoc.buf.s);
-	if(dlg_dmq_send(&jdoc.buf, 0) != 0) {
+	if(dlg_dmq_send(&jdoc.buf, dmq_node) != 0) {
 		goto error;
 	}
 
@@ -519,12 +634,20 @@ int dlg_dmq_replicate_action(dlg_dmq_action_t action, dlg_cell_t *dlg,
 	srjson_AddNumberToObject(&jdoc, jdoc.root, "action", action);
 	srjson_AddNumberToObject(&jdoc, jdoc.root, "h_entry", dlg->h_entry);
 	srjson_AddNumberToObject(&jdoc, jdoc.root, "h_id", dlg->h_id);
+	srjson_AddNumberToObject(
+			&jdoc, jdoc.root, "last_modified", dlg->last_modified);
 
 	switch(action) {
 		case DLG_DMQ_UPDATE:
 			dlg->iflags |= DLG_IFLAG_DMQ_SYNC;
 			dlg->dflags &= ~DLG_FLAG_CHANGED_PROF;
 			srjson_AddNumberToObject(&jdoc, jdoc.root, "init_ts", dlg->init_ts);
+			if(dlg_dmq_ka_iflags_sync != 0
+					|| dlg_dmq_timeout_iflags_sync != 0) {
+				/* send iflags from owner */
+				srjson_AddNumberToObject(
+						&jdoc, jdoc.root, "iflags", dlg->iflags);
+			}
 			srjson_AddStrToObject(
 					&jdoc, jdoc.root, "callid", dlg->callid.s, dlg->callid.len);
 
@@ -571,6 +694,16 @@ int dlg_dmq_replicate_action(dlg_dmq_action_t action, dlg_cell_t *dlg,
 
 		case DLG_DMQ_STATE:
 			srjson_AddNumberToObject(&jdoc, jdoc.root, "state", dlg->state);
+			if(action != DLG_DMQ_UPDATE && dlg_dmq_load_callbacks != 0
+					&& dlg->vars != NULL) {
+				srjson_t *pj = NULL;
+				pj = srjson_CreateObject(&jdoc);
+				for(var = dlg->vars; var; var = var->next) {
+					srjson_AddStrToObject(&jdoc, pj, var->key.s, var->value.s,
+							var->value.len);
+				}
+				srjson_AddItemToObject(&jdoc, jdoc.root, "vars", pj);
+			}
 			switch(dlg->state) {
 				case DLG_STATE_EARLY:
 					srjson_AddNumberToObject(
@@ -618,6 +751,9 @@ int dlg_dmq_replicate_action(dlg_dmq_action_t action, dlg_cell_t *dlg,
 					//dlg->iflags &= ~DLG_IFLAG_DMQ_SYNC;
 					break;
 				default:
+					/* lifetime on UPDATE fallthrough */
+					srjson_AddNumberToObject(
+							&jdoc, jdoc.root, "lifetime", dlg->lifetime);
 					LM_DBG("not syncing state %u\n", dlg->state);
 			}
 			break;
@@ -682,4 +818,73 @@ int dmq_send_all_dlgs(dmq_node_t *dmq_node)
 	}
 
 	return 0;
+}
+
+
+int ki_dlg_remove_dialogs_from_node(sip_msg_t *msg, str *node_uri)
+{
+	unsigned int i;
+	dlg_cell_t *dlg;
+	dlg_cell_t *tdlg;
+	int ret;
+	int count = 0;
+
+	if(node_uri == NULL || node_uri->s == NULL || node_uri->len <= 0) {
+		LM_ERR("invalid node_uri parameter\n");
+		return -1;
+	}
+
+	if(d_table == NULL) {
+		LM_ERR("dialog table not initialized\n");
+		return -1;
+	}
+
+	LM_DBG("removing DMQ-synced dialogs from node [%.*s]\n", node_uri->len,
+			node_uri->s);
+
+	for(i = 0; i < d_table->size; i++) {
+		dlg_lock(d_table, &d_table->entries[i]);
+		dlg = d_table->entries[i].first;
+		while(dlg) {
+			tdlg = dlg;
+			dlg = dlg->next;
+			if(!(tdlg->iflags & DLG_IFLAG_DMQ_SYNC)) {
+				continue;
+			}
+			if(tdlg->dmq_node_uri.len != node_uri->len
+					|| strncmp(tdlg->dmq_node_uri.s, node_uri->s, node_uri->len)
+							   != 0) {
+				continue;
+			}
+			LM_DBG("removing dlg [%u:%u] callid [%.*s] state [%u] "
+				   "from node [%.*s]\n",
+					tdlg->h_entry, tdlg->h_id, tdlg->callid.len, tdlg->callid.s,
+					tdlg->state, node_uri->len, node_uri->s);
+			if(tdlg->state == DLG_STATE_CONFIRMED
+					|| tdlg->state == DLG_STATE_EARLY) {
+				ret = remove_dialog_timer(&tdlg->tl);
+				if(ret < 0) {
+					LM_CRIT("unable to unlink timer on dlg %p [%u:%u]\n", tdlg,
+							tdlg->h_entry, tdlg->h_id);
+				}
+			}
+			if(tdlg->state == DLG_STATE_CONFIRMED
+					|| tdlg->state == DLG_STATE_CONFIRMED_NA) {
+				if_update_stat(dlg_enable_stats, active_dlgs, -1);
+			} else if(tdlg->state == DLG_STATE_EARLY) {
+				if_update_stat(dlg_enable_stats, early_dlgs, -1);
+			}
+			/* prevent DB sync and DMQ re-broadcast */
+			tdlg->dflags |= DLG_FLAG_NEW;
+			tdlg->iflags &= ~DLG_IFLAG_DMQ_SYNC;
+			unlink_unsafe_dlg(&d_table->entries[i], tdlg);
+			destroy_dlg(tdlg);
+			count++;
+		}
+		dlg_unlock(d_table, &d_table->entries[i]);
+	}
+
+	LM_INFO("removed %d DMQ-synced dialogs from node [%.*s]\n", count,
+			node_uri->len, node_uri->s);
+	return count > 0 ? 1 : -1;
 }

@@ -34,9 +34,11 @@ static int *pres_dmq_recv = 0;
 dmq_api_t pres_dmqb;
 dmq_peer_t *pres_dmq_peer = NULL;
 
+extern str pres_dmq_peer_id;
+
 int pres_dmq_send_all_presentities(dmq_node_t *dmq_node);
 int pres_dmq_send_all_subscriptions(dmq_node_t *dmq_node);
-int pres_dmq_request_sync();
+int pres_dmq_request_sync(dmq_node_t *dmq_node);
 
 /**
 * @brief add notification peer
@@ -55,10 +57,8 @@ int pres_dmq_initialize()
 
 	not_peer.callback = pres_dmq_handle_msg;
 	not_peer.init_callback = pres_dmq_request_sync;
-	not_peer.description.s = "presence";
-	not_peer.description.len = 8;
-	not_peer.peer_id.s = "presence";
-	not_peer.peer_id.len = 8;
+	not_peer.peer_id = pres_dmq_peer_id;
+	not_peer.description = pres_dmq_peer_id;
 	pres_dmq_peer = pres_dmqb.register_dmq_peer(&not_peer);
 	if(!pres_dmq_peer) {
 		LM_ERR("error in register_dmq_peer\n");
@@ -194,8 +194,9 @@ presentity_t *pres_parse_json_presentity(srjson_t *in)
 				return NULL;
 			}
 		} else {
-			LM_ERR("unrecognized field in json object\n");
-			return NULL;
+			LM_WARN("unrecognized field [%s] in presentity json object"
+					" - skipping\n",
+					p_it->string);
 		}
 	}
 
@@ -302,6 +303,8 @@ subs_t *pres_parse_json_subscription(srjson_t *in)
 			subscription.updated = SRJSON_GET_INT(s_it);
 		} else if(strcmp(s_it->string, "updated_winfo") == 0) {
 			subscription.updated_winfo = SRJSON_GET_INT(s_it);
+		} else if(strcmp(s_it->string, "recv") == 0) {
+			subscription.received_time = SRJSON_GET_INT(s_it);
 		} else if(strcmp(s_it->string, "event") == 0) {
 			s_event_str.s = s_it->valuestring;
 			s_event_str.len = strlen(s_it->valuestring);
@@ -311,8 +314,8 @@ subs_t *pres_parse_json_subscription(srjson_t *in)
 				return NULL;
 			}
 		} else {
-			LM_ERR("unrecognized field in json object\n");
-			return NULL;
+			LM_WARN("unrecognized field [%s] in json object - skipping\n",
+					s_it->string);
 		}
 	}
 
@@ -366,10 +369,7 @@ int pres_dmq_handle_msg(
 		goto invalid;
 	}
 
-	body.s = get_body(msg);
-	body.len = content_length;
-
-	if(!body.s) {
+	if(get_body_str(msg, &body) < 0) {
 		LM_ERR("unable to get body\n");
 		goto error;
 	}
@@ -427,8 +427,9 @@ int pres_dmq_handle_msg(
 				p_body.s = NULL;
 			}
 		} else {
-			LM_ERR("unrecognized field in json object\n");
-			goto invalid;
+			LM_WARN("unrecognized field [%s] in dmq json object"
+					" - skipping\n",
+					it->string);
 		}
 	}
 
@@ -490,7 +491,7 @@ cleanup:
 }
 
 
-int pres_dmq_request_method_sync(int action)
+int pres_dmq_request_method_sync(int action, dmq_node_t *dmq_node)
 {
 	srjson_doc_t jdoc;
 
@@ -512,7 +513,7 @@ int pres_dmq_request_method_sync(int action)
 	}
 	jdoc.buf.len = strlen(jdoc.buf.s);
 	LM_DBG("sending serialized data %.*s\n", jdoc.buf.len, jdoc.buf.s);
-	if(pres_dmq_send(&jdoc.buf, 0) != 0) {
+	if(pres_dmq_send(&jdoc.buf, dmq_node) != 0) {
 		goto error;
 	}
 
@@ -531,16 +532,18 @@ error:
 }
 
 
-int pres_dmq_request_sync()
+int pres_dmq_request_sync(dmq_node_t *dmq_node)
 {
 	if(pres_enable_pres_dmq > 0 && pres_enable_pres_sync_dmq > 0) {
-		if(pres_dmq_request_method_sync(PRES_DMQ_SYNC_PRESENTITY) != 0) {
+		if(pres_dmq_request_method_sync(PRES_DMQ_SYNC_PRESENTITY, dmq_node)
+				!= 0) {
 			LM_ERR("cannot send presence sync request\n");
 			return -1;
 		}
 	}
 	if(pres_enable_subs_dmq > 0 && pres_enable_subs_sync_dmq > 0) {
-		if(pres_dmq_request_method_sync(PRES_DMQ_SYNC_SUBSCRIPTION) != 0) {
+		if(pres_dmq_request_method_sync(PRES_DMQ_SYNC_SUBSCRIPTION, dmq_node)
+				!= 0) {
 			LM_ERR("cannot send subscription sync request\n");
 			return -1;
 		}
@@ -730,6 +733,8 @@ int pres_dmq_replicate_subscription(subs_t *subscription, dmq_node_t *node)
 	srjson_AddNumberToObject(&jdoc, s_json, "updated", subscription->updated);
 	srjson_AddNumberToObject(
 			&jdoc, s_json, "updated_winfo", subscription->updated_winfo);
+	srjson_AddNumberToObject(
+			&jdoc, s_json, "recv", subscription->received_time);
 
 	srjson_AddItemToObject(&jdoc, jdoc.root, "subscription", s_json);
 

@@ -114,17 +114,12 @@ void free_ppublic(ppublic_t *_p)
 
 
 // The same piece of code also lives in modules/ims_registrar_pcscf/sec_agree.c
-// Function - parse_sec_agree()
-// goto label - cleanup
+// Function - free_security_t()
 // Keep them in sync!
 void free_security(security_t *_p)
 {
 	if(!_p) {
 		return;
-	}
-
-	if(_p->sec_header.s) {
-		shm_free(_p->sec_header.s);
 	}
 
 	switch(_p->type) {
@@ -199,7 +194,6 @@ int new_pcontact(struct udomain *_d, str *_contact, struct pcontact_info *_ci,
 	if(parse_uri((*_c)->aor.s, (*_c)->aor.len, &sip_uri) != 0) {
 		LM_ERR("unable to determine contact host from uri [%.*s\n",
 				(*_c)->aor.len, (*_c)->aor.s);
-		shm_free((*_c)->aor.s);
 		shm_free(*_c);
 		*_c = 0;
 		return -2;

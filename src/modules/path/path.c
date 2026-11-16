@@ -37,6 +37,7 @@
 #include "../../core/data_lump.h"
 #include "../../core/parser/parse_param.h"
 #include "../../core/parser/parse_uri.h"
+#include "../../core/config.h"
 #include "../../core/strutils.h"
 #include "../../core/dset.h"
 
@@ -103,8 +104,43 @@ static int handleOutbound(sip_msg_t *_m, str *user, path_param_t *param)
 	return 1;
 }
 
-static int prepend_path(
-		sip_msg_t *_m, str *user, path_param_t param, str *add_params)
+/*! \brief
+ * Validate the advertised address value given to the add_path_*_advertised_*
+ * functions. The value is expected to be a valid host part, optionally
+ * followed by a port (e.g. "proxy.example.com" or "1.2.3.4:5080").
+ */
+static int path_check_advertised_address(str *addr)
+{
+	char buf[MAX_URI_SIZE];
+	struct sip_uri uri;
+	int len;
+
+	if(addr == NULL || addr->len <= 0 || addr->s == NULL) {
+		LM_ERR("empty advertised address value\n");
+		return -1;
+	}
+
+	if(addr->len > MAX_URI_SIZE - 7) {
+		LM_ERR("advertised address is too long (%d)\n", addr->len);
+		return -1;
+	}
+
+	memcpy(buf, "sip:", 4);
+	memcpy(buf + 4, addr->s, addr->len);
+	memcpy(buf + 4 + addr->len, ";lr", 3);
+	len = 4 + addr->len + 3;
+
+	memset(&uri, 0, sizeof(uri));
+	if(parse_uri(buf, len, &uri) < 0 || uri.host.len <= 0) {
+		LM_ERR("invalid advertised address: %.*s\n", addr->len, addr->s);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int prepend_path(sip_msg_t *_m, str *user, path_param_t param,
+		str *add_params, str *adv_addr)
 {
 	struct lump *l;
 	char *prefix, *suffix, *dp;
@@ -206,10 +242,33 @@ static int prepend_path(
 	l = insert_new_lump_before(l, prefix, prefix_len, 0);
 	if(!l)
 		goto out3;
-	l = insert_subst_lump_before(
-			l, (path_sockname_mode) ? SUBST_SND_ALL_EX : SUBST_SND_ALL, 0);
-	if(!l)
-		goto out2;
+	if(adv_addr && adv_addr->len > 0) {
+		dp = path_strzdup(adv_addr->s, adv_addr->len);
+		if(dp == NULL)
+			goto out2;
+		l = insert_new_lump_before(l, dp, adv_addr->len, 0);
+		if(!l)
+			goto out2;
+		dp = path_strzdup(TRANSPORT_PARAM, TRANSPORT_PARAM_LEN);
+		if(dp == NULL)
+			goto out2;
+		l = insert_new_lump_before(l, dp, TRANSPORT_PARAM_LEN, 0);
+		if(!l)
+			goto out2;
+		l = insert_subst_lump_before(l, SUBST_SND_PROTO, 0);
+		if(!l)
+			goto out2;
+		if(path_sockname_mode) {
+			l = insert_subst_lump_before(l, SUBST_SND_SOCKNAME, 0);
+			if(!l)
+				goto out2;
+		}
+	} else {
+		l = insert_subst_lump_before(
+				l, (path_sockname_mode) ? SUBST_SND_ALL_EX : SUBST_SND_ALL, 0);
+		if(!l)
+			goto out2;
+	}
 	l = insert_new_lump_before(l, suffix, cp.len, 0);
 	if(!l)
 		goto out2;
@@ -221,10 +280,33 @@ static int prepend_path(
 		l = insert_new_lump_before(l, dp, prefix_len, 0);
 		if(!l)
 			goto out1;
-		l = insert_subst_lump_before(
-				l, (path_sockname_mode) ? SUBST_RCV_ALL_EX : SUBST_RCV_ALL, 0);
-		if(!l)
-			goto out1;
+		if(adv_addr && adv_addr->len > 0) {
+			dp = path_strzdup(adv_addr->s, adv_addr->len);
+			if(dp == NULL)
+				goto out1;
+			l = insert_new_lump_before(l, dp, adv_addr->len, 0);
+			if(!l)
+				goto out1;
+			dp = path_strzdup(TRANSPORT_PARAM, TRANSPORT_PARAM_LEN);
+			if(dp == NULL)
+				goto out1;
+			l = insert_new_lump_before(l, dp, TRANSPORT_PARAM_LEN, 0);
+			if(!l)
+				goto out1;
+			l = insert_subst_lump_before(l, SUBST_RCV_PROTO, 0);
+			if(!l)
+				goto out1;
+			if(path_sockname_mode) {
+				l = insert_subst_lump_before(l, SUBST_RCV_SOCKNAME, 0);
+				if(!l)
+					goto out1;
+			}
+		} else {
+			l = insert_subst_lump_before(l,
+					(path_sockname_mode) ? SUBST_RCV_ALL_EX : SUBST_RCV_ALL, 0);
+			if(!l)
+				goto out1;
+		}
 		dp = path_strzdup(suffix, cp.len);
 		if(dp == NULL)
 			goto out1;
@@ -257,7 +339,7 @@ int ki_add_path(struct sip_msg *_msg)
 	ret = handleOutbound(_msg, &user, &param);
 
 	if(ret > 0) {
-		ret = prepend_path(_msg, &user, param, NULL);
+		ret = prepend_path(_msg, &user, param, NULL, NULL);
 	}
 
 	if(user.s != NULL) {
@@ -294,7 +376,7 @@ int add_path_usr(struct sip_msg *_msg, char *_usr, char *_parms)
 		}
 	}
 
-	return prepend_path(_msg, &user, PATH_PARAM_NONE, &parms);
+	return prepend_path(_msg, &user, PATH_PARAM_NONE, &parms, NULL);
 }
 
 /*! \brief
@@ -304,7 +386,7 @@ int add_path_usr(struct sip_msg *_msg, char *_usr, char *_parms)
 int ki_add_path_user(sip_msg_t *_msg, str *_user)
 {
 	str parms = {0, 0};
-	return prepend_path(_msg, _user, PATH_PARAM_NONE, &parms);
+	return prepend_path(_msg, _user, PATH_PARAM_NONE, &parms, NULL);
 }
 
 /*! \brief
@@ -313,7 +395,7 @@ int ki_add_path_user(sip_msg_t *_msg, str *_user)
  */
 int ki_add_path_user_params(sip_msg_t *_msg, str *_user, str *_params)
 {
-	return prepend_path(_msg, _user, PATH_PARAM_NONE, _params);
+	return prepend_path(_msg, _user, PATH_PARAM_NONE, _params, NULL);
 }
 
 /*! \brief
@@ -329,7 +411,7 @@ int ki_add_path_received(sip_msg_t *_msg)
 	ret = handleOutbound(_msg, &user, &param);
 
 	if(ret > 0) {
-		ret = prepend_path(_msg, &user, param, NULL);
+		ret = prepend_path(_msg, &user, param, NULL, NULL);
 	}
 
 	if(user.s != NULL) {
@@ -370,7 +452,7 @@ int add_path_received_usr(struct sip_msg *_msg, char *_usr, char *_parms)
 		}
 	}
 
-	return prepend_path(_msg, &user, PATH_PARAM_RECEIVED, &parms);
+	return prepend_path(_msg, &user, PATH_PARAM_RECEIVED, &parms, NULL);
 }
 
 /*! \brief
@@ -380,7 +462,7 @@ int add_path_received_usr(struct sip_msg *_msg, char *_usr, char *_parms)
 int ki_add_path_received_user(sip_msg_t *_msg, str *_user)
 {
 	str parms = {0, 0};
-	return prepend_path(_msg, _user, PATH_PARAM_RECEIVED, &parms);
+	return prepend_path(_msg, _user, PATH_PARAM_RECEIVED, &parms, NULL);
 }
 
 /*! \brief
@@ -389,7 +471,157 @@ int ki_add_path_received_user(sip_msg_t *_msg, str *_user)
  */
 int ki_add_path_received_user_params(sip_msg_t *_msg, str *_user, str *_params)
 {
-	return prepend_path(_msg, _user, PATH_PARAM_RECEIVED, _params);
+	return prepend_path(_msg, _user, PATH_PARAM_RECEIVED, _params, NULL);
+}
+
+/*! \brief
+ * Prepend own uri to Path header building the host part from the given
+ * advertised address instead of the outgoing socket address. Mirrors the
+ * behaviour of add_path()/add_path_received() (including outbound handling).
+ */
+static int prepend_path_advertised_address(
+		sip_msg_t *_msg, str *_addr, path_param_t param)
+{
+	str user = {0, 0};
+	int ret;
+
+	if(path_check_advertised_address(_addr) < 0)
+		return -1;
+
+	ret = handleOutbound(_msg, &user, &param);
+
+	if(ret > 0) {
+		ret = prepend_path(_msg, &user, param, NULL, _addr);
+	}
+
+	if(user.s != NULL) {
+		pkg_free(user.s);
+	}
+
+	return ret;
+}
+
+/*! \brief
+ * Prepend own uri to Path header building the host part from the given
+ * advertised address instead of the outgoing socket address and take care of
+ * the given user (and parameters). Mirrors add_path(user[, params]) /
+ * add_path_received(user[, params]).
+ */
+static int prepend_path_advertised_address_usr(sip_msg_t *_msg, str *_addr,
+		str *_user, str *_params, path_param_t param)
+{
+	if(path_check_advertised_address(_addr) < 0)
+		return -1;
+
+	return prepend_path(_msg, _user, param, _params, _addr);
+}
+
+/*! \brief
+ * Resolve the config function parameters and prepend a Path header using the
+ * given advertised address. When no user is given the behaviour matches
+ * add_path()/add_path_received(), otherwise add_path(user[, params]) /
+ * add_path_received(user[, params]).
+ */
+static int add_path_advertised_address_f(sip_msg_t *_msg, char *_addr,
+		char *_usr, char *_parms, path_param_t param)
+{
+	str addr = {0, 0};
+	str user = {0, 0};
+	str parms = {0, 0};
+
+	if(_addr == NULL) {
+		LM_ERR("advertised address parameter is required\n");
+		return -1;
+	}
+	if(get_str_fparam(&addr, _msg, (fparam_t *)_addr) < 0) {
+		LM_ERR("failed to get advertised address value\n");
+		return -1;
+	}
+
+	if(_usr == NULL) {
+		return prepend_path_advertised_address(_msg, &addr, param);
+	}
+
+	if(get_str_fparam(&user, _msg, (fparam_t *)_usr) < 0) {
+		LM_ERR("failed to get user value\n");
+		return -1;
+	}
+	if(_parms) {
+		if(get_str_fparam(&parms, _msg, (fparam_t *)_parms) < 0) {
+			LM_ERR("failed to get params value\n");
+			return -1;
+		}
+	}
+
+	return prepend_path_advertised_address_usr(
+			_msg, &addr, &user, &parms, param);
+}
+
+/*! \brief
+ * Prepend own uri to Path header using the given advertised address.
+ */
+int add_path_advertised_address(
+		sip_msg_t *_msg, char *_addr, char *_usr, char *_parms)
+{
+	return add_path_advertised_address_f(
+			_msg, _addr, _usr, _parms, PATH_PARAM_NONE);
+}
+
+/*! \brief
+ * Prepend own uri to Path header using the given advertised address and append
+ * the received address as "received"-param.
+ */
+int add_path_received_advertised_address(
+		sip_msg_t *_msg, char *_addr, char *_usr, char *_parms)
+{
+	return add_path_advertised_address_f(
+			_msg, _addr, _usr, _parms, PATH_PARAM_RECEIVED);
+}
+
+/*! \brief
+ * KEMI: prepend own uri to Path header using the given advertised address.
+ */
+int ki_add_path_advertised_address(sip_msg_t *_msg, str *_addr)
+{
+	return prepend_path_advertised_address(_msg, _addr, PATH_PARAM_NONE);
+}
+
+int ki_add_path_advertised_address_user(sip_msg_t *_msg, str *_addr, str *_user)
+{
+	str parms = {0, 0};
+	return prepend_path_advertised_address_usr(
+			_msg, _addr, _user, &parms, PATH_PARAM_NONE);
+}
+
+int ki_add_path_advertised_address_user_params(
+		sip_msg_t *_msg, str *_addr, str *_user, str *_params)
+{
+	return prepend_path_advertised_address_usr(
+			_msg, _addr, _user, _params, PATH_PARAM_NONE);
+}
+
+/*! \brief
+ * KEMI: prepend own uri to Path header using the given advertised address and
+ * append the received address as "received"-param.
+ */
+int ki_add_path_received_advertised_address(sip_msg_t *_msg, str *_addr)
+{
+	return prepend_path_advertised_address(_msg, _addr, PATH_PARAM_RECEIVED);
+}
+
+int ki_add_path_received_advertised_address_user(
+		sip_msg_t *_msg, str *_addr, str *_user)
+{
+	str parms = {0, 0};
+	return prepend_path_advertised_address_usr(
+			_msg, _addr, _user, &parms, PATH_PARAM_RECEIVED);
+}
+
+int ki_add_path_received_advertised_address_user_params(
+		sip_msg_t *_msg, str *_addr, str *_user, str *_params)
+{
+	return prepend_path_advertised_address_usr(
+			_msg, _addr, _user, _params, PATH_PARAM_RECEIVED);
 }
 
 /*! \brief

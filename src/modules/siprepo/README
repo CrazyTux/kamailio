@@ -32,11 +32,12 @@ Daniel-Constantin Mierla
 
         4. Functions
 
-              4.1. sr_msg_push(msgid)
-              4.2. sr_msg_pull(callid, msgid, rname)
-              4.3. sr_msg_async_pull(callid, msgid, gname, rname)
+              4.1. sr_msg_push(msgid, rmode)
+              4.2. sr_msg_pull(callid, msgid, rname, rmode)
+              4.3. sr_msg_async_pull(callid, msgid, gname, rname, rmode)
               4.4. sr_msg_rm(callid, msgid)
               4.5. sr_msg_check()
+              4.6. sr_msg_match(mode)
 
    List of Examples
 
@@ -49,6 +50,7 @@ Daniel-Constantin Mierla
    1.7. sr_msg_async_pull() usage
    1.8. sr_msg_rm() usage
    1.9. sr_msg_check() usage
+   1.10. sr_msg_match() usage
 
 Chapter 1. Admin Guide
 
@@ -69,11 +71,12 @@ Chapter 1. Admin Guide
 
    4. Functions
 
-        4.1. sr_msg_push(msgid)
-        4.2. sr_msg_pull(callid, msgid, rname)
-        4.3. sr_msg_async_pull(callid, msgid, gname, rname)
+        4.1. sr_msg_push(msgid, rmode)
+        4.2. sr_msg_pull(callid, msgid, rname, rmode)
+        4.3. sr_msg_async_pull(callid, msgid, gname, rname, rmode)
         4.4. sr_msg_rm(callid, msgid)
         4.5. sr_msg_check()
+        4.6. sr_msg_match(mode)
 
 1. Overview
 
@@ -149,16 +152,18 @@ modparam("siprepo", "timer_procs", 2)
 
 4. Functions
 
-   4.1. sr_msg_push(msgid)
-   4.2. sr_msg_pull(callid, msgid, rname)
-   4.3. sr_msg_async_pull(callid, msgid, gname, rname)
+   4.1. sr_msg_push(msgid, rmode)
+   4.2. sr_msg_pull(callid, msgid, rname, rmode)
+   4.3. sr_msg_async_pull(callid, msgid, gname, rname, rmode)
    4.4. sr_msg_rm(callid, msgid)
    4.5. sr_msg_check()
+   4.6. sr_msg_match(mode)
 
-4.1.  sr_msg_push(msgid)
+4.1.  sr_msg_push(msgid, rmode)
 
    Push the message content to hash table and associate it with `msgid`.
-   The Call-Id and msgid are needed to pull the message.
+   The Call-Id and msgid are needed to pull the message. The rmode is
+   reserved for repo mode, use 0.
 
    This function can be used from ANY_ROUTE.
 
@@ -167,15 +172,18 @@ modparam("siprepo", "timer_procs", 2)
 request_route {
     ...
     $var(msgid) = $sruid;
-    if(sr_msg_push("$var(msgid)")) {
+    if(sr_msg_push("$var(msgid)", "0")) {
+        ...
     }
     ...
 }
 ...
 
-4.2.  sr_msg_pull(callid, msgid, rname)
+4.2.  sr_msg_pull(callid, msgid, rname, rmode)
 
-   Pull the message content and execute the route block 'rname'.
+   Pull the message content and execute the route block 'rname'. If rmode
+   is set to "1", the item of the message is removed from siprepo storage,
+   use "0" to keep it.
 
    This function can be used from ANY_ROUTE.
 
@@ -183,16 +191,17 @@ request_route {
 ...
 request_route {
     ...
-    if(sr_msg_pull("$var(callid)", "$var(msgid)", "REPOPULL")) {
+    if(sr_msg_pull("$var(callid)", "$var(msgid)", "REPOPULL", "1")) {
     }
     ...
 }
 ...
 
-4.3.  sr_msg_async_pull(callid, msgid, gname, rname)
+4.3.  sr_msg_async_pull(callid, msgid, gname, rname, rmode)
 
    Pull the message content and execute the route block 'rname' via async
-   group 'gname'.
+   group 'gname'. If rmode is set to "1", the item of the message is
+   removed from siprepo storage, use "0" to keep it.
 
    This function can be used from ANY_ROUTE.
 
@@ -200,7 +209,8 @@ request_route {
 ...
 request_route {
     ...
-    if(sr_msg_async_pull("$var(callid)", "$var(msgid)", "WG01", "REPOPULL")) {
+    if(sr_msg_async_pull("$var(callid)", "$var(msgid)", "WG01", "REPOPULL", "1")
+) {
     }
     ...
 }
@@ -208,7 +218,7 @@ request_route {
 
 4.4.  sr_msg_rm(callid, msgid)
 
-   Remove the message content.
+   Remove the item of the message from the siprepo storage.
 
    This function can be used from ANY_ROUTE.
 
@@ -224,7 +234,7 @@ request_route {
 
 4.5.  sr_msg_check()
 
-   Check if the message is stored.
+   Check if the message is stored by matching the Call-Id.
 
    This function can be used from ANY_ROUTE.
 
@@ -233,6 +243,27 @@ request_route {
 request_route {
     ...
     if(sr_msg_check()) {
+    }
+    ...
+}
+...
+
+4.6.  sr_msg_match(mode)
+
+   Check if the message is stored by matching first the Call-Id and then
+   match first Via branch parameter if mode is 1 (if no Via branch was
+   stored, then matching on Call-Id only returns success).
+
+   Return: negative (false) on error or not found; positive (true) on
+   found (1 - matched on Call-Id; 2 - Matched on Call-Id and Via-branch).
+
+   This function can be used from ANY_ROUTE.
+
+   Example 1.10. sr_msg_match() usage
+...
+request_route {
+    ...
+    if(sr_msg_match("1")) {
     }
     ...
 }

@@ -1615,10 +1615,34 @@ static int subst_v_f(sip_msg_t *msg, char *pitext, char *psubex, char *popv)
 }
 
 
+/* Move to the first real line start, ignoring standalone CR bytes that can
+ * occur in binary MIME body parts. */
+static inline int advance_to_next_line(char **buf, unsigned int *buf_len)
+{
+	char *ch;
+	unsigned int offset;
+	int is_crlf;
+
+	while(*buf_len > 1) {
+		ch = memchr(*buf, 13, *buf_len - 1);
+		if(ch == NULL)
+			return 0;
+
+		is_crlf = *(ch + 1) == 10;
+		offset = ch - *buf + 1 + is_crlf;
+		*buf += offset;
+		*buf_len -= offset;
+		if(is_crlf)
+			return 1;
+	}
+
+	return 0;
+}
+
 static inline int find_line_start(
 		char *text, unsigned int text_len, char **buf, unsigned int *buf_len)
 {
-	char *ch, *start;
+	char *start;
 	unsigned int len;
 
 	start = *buf;
@@ -1630,14 +1654,7 @@ static inline int find_line_start(
 			*buf_len = len;
 			return 1;
 		}
-		if((ch = memchr(start, 13, len - 1))) {
-			if(*(ch + 1) != 10) {
-				LM_ERR("No LF after CR\n");
-				return 0;
-			}
-			len = len - (ch - start + 2);
-			start = ch + 2;
-		} else {
+		if(!advance_to_next_line(&start, &len)) {
 			LM_ERR("No CRLF found\n");
 			return 0;
 		}
@@ -1680,14 +1697,7 @@ static inline int find_hdr_line_start(char *hname, unsigned int hname_len,
 			}
 		}
 		/* jump to next line */
-		if((ch = memchr(start, 13, len - 1))) {
-			if(*(ch + 1) != 10) {
-				LM_ERR("No LF after CR\n");
-				return 0;
-			}
-			len = len - (ch - start + 2);
-			start = ch + 2;
-		} else {
+		if(!advance_to_next_line(&start, &len)) {
 			LM_ERR("No CRLF found\n");
 			return 0;
 		}
@@ -2807,7 +2817,7 @@ static str *generate_boundary(str *txt, str *content_type,
 	n->len = delimiter->len + 2 + CRLF_LEN;
 	if(initial)
 		n->len = 2 * n->len;
-	if(strncmp("\r\n\r\n", txt->s + txt->len - 4, 4) != 0) {
+	if(txt->len < 4 || strncmp("\r\n\r\n", txt->s + txt->len - 4, 4) != 0) {
 		n->len = n->len + CRLF_LEN;
 		flag = 1;
 		LM_DBG("adding final CRLF+CRLF\n");
@@ -3179,6 +3189,7 @@ int ki_append_multibody_cd(sip_msg_t *msg, str *txt, str *ct, str *cd)
 {
 	struct lump *l;
 	int off;
+	int mime;
 	str body = {0, 0};
 	str *nbb = NULL;
 	str delimiter = {0, 0};
@@ -3204,9 +3215,23 @@ int ki_append_multibody_cd(sip_msg_t *msg, str *txt, str *ct, str *cd)
 		return -1;
 	}
 
+	mime = parse_content_type_hdr(msg);
+	if(mime < 0) {
+		LM_ERR("failed to parse Content-Type header\n");
+		return -1;
+	}
+	if(msg->content_type == NULL) {
+		LM_ERR("missing Content-Type header for existing message body\n");
+		return -1;
+	}
+
 	off = body.s - msg->buf;
 	if((l = anchor_lump(msg, off + body.len, 0, 0)) == 0) {
-		LM_ERR("WTF\n");
+		LM_ERR("failed to anchor lump\n");
+		return -1;
+	}
+	if(mime != MIMETYPE(MULTIPART, MIXED)) {
+		LM_ERR("message body is not multipart/mixed\n");
 		return -1;
 	}
 	/* get delimiter no initial -- */
@@ -4116,6 +4141,12 @@ static int has_body_helper(sip_msg_t *msg, int type)
 	/* check type also? */
 	if(type == 0)
 		return 1;
+
+	if((((unsigned int)type >> 16) == TYPE_UNKNOWN)
+			|| (((unsigned int)type & 0x00ff) == SUBTYPE_UNKNOWN)) {
+		LM_ERR("The searched content type is an unknown type.\n");
+		return -1;
+	}
 
 	/* the function search for and parses the Content-Type hdr */
 	mime = parse_content_type_hdr(msg);

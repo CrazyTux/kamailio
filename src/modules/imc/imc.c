@@ -59,7 +59,7 @@ MODULE_VERSION
 /** header variables */
 str imc_hdrs = str_init("Supported: kamailio/imc\r\n");
 char hdr_buf[1024];
-str all_hdrs;
+str all_hdrs = str_init("");
 
 /** parameters */
 db1_con_t *imc_db = NULL;
@@ -185,7 +185,7 @@ static int mod_init(void)
 	}
 
 	if(extra_hdrs.s) {
-		if(extra_hdrs.len + imc_hdrs.len > 1024) {
+		if(extra_hdrs.len + imc_hdrs.len >= 1024) {
 			LM_ERR("extra_hdrs too long\n");
 			return -1;
 		}
@@ -280,8 +280,7 @@ static int ki_imc_manager(struct sip_msg *msg)
 	struct imc_uri src, dst;
 	int ret = -1;
 
-	body.s = get_body(msg);
-	if(body.s == 0) {
+	if(get_body_str(msg, &body) < 0) {
 		LM_ERR("cannot extract body from msg\n");
 		goto error;
 	}
@@ -291,7 +290,6 @@ static int ki_imc_manager(struct sip_msg *msg)
 		LM_ERR("no Content-Length\n");
 		goto error;
 	}
-	body.len = get_content_length(msg);
 
 	if(body.len <= 0) {
 		LM_DBG("empty body!\n");

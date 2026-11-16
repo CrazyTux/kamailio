@@ -383,7 +383,7 @@ switch($rc) {
           <para>
             <itemizedlist>
               <listitem>
-		<emphasis> IPv4 </emphasis> - PUBLIC, RIVATE, SHARED, LOOPBACK, LINK-LOCAL, RESERVED, TEST-NET, 6TO4-RELAY, MULTICAST, BROADCAST
+		<emphasis> IPv4 </emphasis> - PUBLIC, PRIVATE, SHARED, LOOPBACK, LINK-LOCAL, RESERVED, TEST-NET, 6TO4-RELAY, MULTICAST, BROADCAST
  	      </listitem>
 	      <listitem>
 		<emphasis> IPv6 </emphasis> - UNSPECIFIED,  LOOPBACK, IPV4MAP, RESERVED, DISCARD, GLOBAL-UNICAST, TEREDO, BMWG, DOCUMENTATION, ORCHID, 6TO4, UNIQUE-LOCAL-UNICAST, LINK-LOCAL-UNICAST, MULTICAST
@@ -823,6 +823,32 @@ if (!dns_sys_match_ip("myhost.com", "1.2.3.4")) {
 if (!dns_int_match_ip("myhost.com", "1.2.3.4")) {
     xdbg("ip address not associated with hostname\n");
 }
+...
+        </programlisting>
+      </example>
+
+    </section>
+
+    <section id="ipops.f.dns_reinit">
+      <title>
+        <function moreinfo="none">dns_reinit()</function>
+      </title>
+
+      <para>
+		  Trigger a libc DNS API reinit, similar to "rpc cfg.seti core dns_reinit 1".
+      </para>
+
+      <para>
+        This function can be used from ANY_ROUTE.
+      </para>
+
+      <example>
+        <title>
+          <function>dns_reinit</function> usage
+        </title>
+        <programlisting format="linespecific">
+...
+dns_reinit();
 ...
         </programlisting>
       </example>

@@ -476,8 +476,8 @@ int update_subs_db(subs_t *subs, int type)
 	return 0;
 }
 
-void delete_subs(
-		str *pres_uri, str *ev_name, str *to_tag, str *from_tag, str *callid)
+void delete_subs(str *pres_uri, str *ev_name, str *to_tag, str *from_tag,
+		str *callid, unsigned int received_time)
 {
 	subs_t subs;
 
@@ -486,6 +486,7 @@ void delete_subs(
 	subs.from_tag = *from_tag;
 	subs.to_tag = *to_tag;
 	subs.callid = *callid;
+	subs.received_time = received_time;
 
 	/* delete record from hash table also if not in dbonly mode */
 	if(pres_subs_dbmode != DB_ONLY) {
@@ -585,8 +586,12 @@ int update_subscription(
 		if(subs->expires == 0) {
 			LM_DBG("expires =0 -> deleting record\n");
 
+			if(subs->received_time == 0) {
+				subs->received_time = (unsigned int)time(NULL);
+			}
+
 			delete_subs(&subs->pres_uri, &subs->event->name, &subs->to_tag,
-					&subs->from_tag, &subs->callid);
+					&subs->from_tag, &subs->callid, subs->received_time);
 
 			if(subs->event->type & PUBL_TYPE) {
 				reply_code = get_ok_reply_code();
@@ -741,8 +746,13 @@ int replace_subscription(subs_t *subs)
 
 	if(subs->expires == 0) {
 		LM_DBG("expires =0 -> deleting record\n");
+
+		if(subs->received_time == 0) {
+			subs->received_time = (unsigned int)time(NULL);
+		}
+
 		delete_subs(&subs->pres_uri, &subs->event->name, &subs->to_tag,
-				&subs->from_tag, &subs->callid);
+				&subs->from_tag, &subs->callid, subs->received_time);
 		return 1;
 	} else {
 		/* if subscriptions are stored in memory, replace them */
@@ -1590,6 +1600,30 @@ int extract_sdialog_info(subs_t *subs, struct sip_msg *msg, int mexp,
 			&reply_str);
 }
 
+/* take the route set from an in-dialog request instead of the stored one */
+static void pres_refresh_rr_from_msg(struct sip_msg *msg, subs_t *subs)
+{
+	str rr_body = {0, 0};
+	int rt;
+
+	if(subs == NULL || msg == NULL || msg->record_route == NULL) {
+		return;
+	}
+
+	rt = print_rr_body(msg->record_route, &rr_body, 0, 0);
+	if(rt != 0) {
+		LM_ERR("failed to process the in-dialog record route [%d]\n", rt);
+		return;
+	}
+
+	if(subs->record_route.s != NULL) {
+		pkg_free(subs->record_route.s);
+	}
+	subs->record_route = rr_body;
+	LM_DBG("route set refreshed from in-dialog request: [%.*s]\n",
+			subs->record_route.len, subs->record_route.s);
+}
+
 int get_stored_info(
 		struct sip_msg *msg, subs_t *subs, int *reply_code, str *reply_str)
 {
@@ -1597,6 +1631,11 @@ int get_stored_info(
 	subs_t *s;
 	int i;
 	unsigned int hash_code;
+
+	/* get Record-Route(s) from SIP msg, if there are any */
+	if(pres_refresh_record_route) {
+		pres_refresh_rr_from_msg(msg, subs);
+	}
 
 	if(pres_subs_dbmode == DB_ONLY) {
 		return get_database_info(msg, subs, reply_code, reply_str);
@@ -1670,7 +1709,9 @@ found_rec:
 		reason.len = s->reason.len;
 		subs->reason = reason;
 	}
-	if(s->record_route.s && s->record_route.len) {
+	/* refresh_record_route: keep the route set taken from the SIP msg */
+	if((!pres_refresh_record_route || subs->record_route.s == NULL)
+			&& s->record_route.s && s->record_route.len) {
 		subs->record_route.s =
 				(char *)pkg_malloc(s->record_route.len * sizeof(char));
 		if(subs->record_route.s == NULL) {
@@ -1769,7 +1810,9 @@ int get_database_info(
 		return -1;
 	}
 
-	if(pres_notifier_processes > 0 && pa_dbf.start_transaction)
+	/* handle_subscribe() opens the transaction only without fast notify */
+	if(pres_notifier_processes > 0 && !pres_send_fast_notify
+			&& pa_dbf.start_transaction)
 		query_fn = pa_dbf.query_lock ? pa_dbf.query_lock : pa_dbf.query;
 
 	if(query_fn(pa_db, query_cols, 0, query_vals, result_cols, n_query_cols,
@@ -1839,7 +1882,9 @@ int get_database_info(
 	}
 
 	record_route.s = (char *)row_vals[record_route_col].val.string_val;
-	if(record_route.s) {
+	/* refresh_record_route: keep the route set taken from the SIP msg */
+	if((!pres_refresh_record_route || subs->record_route.s == NULL)
+			&& record_route.s) {
 		record_route.len = strlen(record_route.s);
 		if(record_route.len > 0) {
 			subs->record_route.s =

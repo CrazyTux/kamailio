@@ -223,6 +223,8 @@ static inline int t_build_msg_from_buf(struct sip_msg *msg, char *buf,
 		return -1;
 	}
 	msg->force_send_socket = uac_r->dialog->send_sock;
+	if(uac_r->ssockmap != NULL)
+		msg->force_send_socket_map = *uac_r->ssockmap;
 	msg->rcv.proto = dst->send_sock->proto;
 	msg->rcv.src_ip = dst->send_sock->address;
 	su2ip_addr(&msg->rcv.dst_ip, &dst->to);
@@ -533,12 +535,12 @@ static inline int t_uac_prepare(
 	if((uri2dst2(cfg_get(core, core_cfg, use_dns_failover)
 						 ? &new_cell->uac[0].dns_h
 						 : 0,
-				&dst, uac_r->dialog->send_sock, snd_flags,
+				&dst, uac_r->dialog->send_sock, uac_r->ssockmap, snd_flags,
 				uac_r->dialog->hooks.next_hop, PROTO_NONE)
 			   == 0)
 			|| (dst.send_sock == 0)) {
 #else  /* USE_DNS_FAILOVER */
-	if((uri2dst2(&dst, uac_r->dialog->send_sock, snd_flags,
+	if((uri2dst2(&dst, uac_r->dialog->send_sock, uac_r->ssockmap, snd_flags,
 				uac_r->dialog->hooks.next_hop, PROTO_NONE)
 			   == 0)
 			|| (dst.send_sock == 0)) {
@@ -571,7 +573,7 @@ static inline int t_uac_prepare(
 	new_cell->fr_inv_timeout = (uac_r->fr_inv_timeout > 0)
 									   ? uac_r->fr_inv_timeout
 									   : cfg_get(tm, tm_cfg, fr_inv_timeout);
-	new_cell->end_of_life = get_ticks_raw() + lifetime;
+	new_cell->end_of_life = tm_get_ticks_raw() + lifetime;
 	/* same as above for retransmission intervals */
 	new_cell->rt_t1_timeout_ms = cfg_get(tm, tm_cfg, rt_t1_timeout_ms);
 	new_cell->rt_t2_timeout_ms = cfg_get(tm, tm_cfg, rt_t2_timeout_ms);
@@ -581,6 +583,8 @@ static inline int t_uac_prepare(
 	request = &new_cell->uac[0].request;
 	request->dst = dst;
 	request->flags |= nhtype;
+	if(uac_r->ssockmap != NULL)
+		new_cell->uac[0].force_send_socket_map = *uac_r->ssockmap;
 
 #ifdef SO_REUSEPORT
 	if(cfg_get(tcp, tcp_cfg, reuse_port)
@@ -593,7 +597,9 @@ static inline int t_uac_prepare(
 #endif
 
 	if(!is_ack) {
-		INIT_REF(new_cell, 1); /* ref'ed only from the hash */
+		/* keep extra temporary local reference to cope with a very fast local
+		 * reply that can free the transaction before arming retransmission */
+		INIT_REF(new_cell, 2); /* hash ref + local send and setup ref */
 		hi = dlg2hash(uac_r->dialog);
 		LOCK_HASH(hi);
 		insert_into_hash_table_unsafe(new_cell, hi);
@@ -627,7 +633,9 @@ static inline int t_uac_prepare(
 		if(likely(t_build_msg_from_buf(&lreq, buf, buf_len, uac_r, &dst)
 				   == 0)) {
 			if(parse_headers(&lreq, HDR_EOH_F, 0) == -1) {
-				LM_ERR("failed to parse headers on uas for failover\n");
+				LM_ERR("failed to parse headers on uas for failover - dns"
+					   " failover disabled for this transaction\n");
+				new_cell->flags |= T_DISABLE_FAILOVER;
 			} else {
 				new_cell->uas.request = sip_msg_cloner(&lreq, &sip_msg_len);
 				lreq.buf = 0;
@@ -640,7 +648,9 @@ static inline int t_uac_prepare(
 						((char *)new_cell->uas.request) + sip_msg_len;
 			}
 		} else {
-			LM_WARN("failed to build uas for failover\n");
+			LM_WARN("failed to build uas for failover - dns failover"
+					" disabled for this transaction\n");
+			new_cell->flags |= T_DISABLE_FAILOVER;
 		}
 	}
 #endif /* USE_DNS_FAILOVER */
@@ -699,12 +709,8 @@ error2:
 	if(is_ack) {
 		free_cell(new_cell);
 	} else {
-		if((new_cell->next_c == 0 && new_cell->prev_c == 0)
-				|| (atomic_get_int(&new_cell->ref_count) == 0)) {
-			free_cell(new_cell);
-		} else {
-			UNREF_FREE(new_cell, 0);
-		}
+		/* local UAC has a temporary extra reference */
+		UNREF_FREE(new_cell, 1);
 	}
 error3:
 	return ret;
@@ -763,7 +769,21 @@ static inline int send_prepared_request_impl(
 	p_msg = t->uas.request;
 
 	if(SEND_BUFFER(request) == -1) {
-		LM_ERR("Attempt to send to precreated request failed\n");
+		LM_WARN("attempt to send local request on branch %d failed\n", branch);
+		uac->icode = 908; /* internal code set to delivery failure */
+#ifdef USE_DNS_FAILOVER
+		/* try next DNS option */
+		if(cfg_get(core, core_cfg, use_dns_failover)) {
+			ret = add_uac_dns_fallback(t, p_msg, uac, retransmit);
+			if(ret >= 0) {
+				uac->last_received = _tm_reply_408_code;
+				LM_DBG("send on local branch %d failed, adding DNS fallback "
+					   "branch %d\n",
+						branch, ret);
+				return ret;
+			}
+		}
+#endif /* USE_DNS_FAILOVER */
 	} else if(unlikely(has_tran_tmcbs(t, TMCB_REQUEST_SENT)))
 		/* we don't know the method here */
 		run_trans_callbacks_with_buf(
@@ -804,9 +824,43 @@ static inline int send_prepared_request_impl(
 	return 0;
 }
 
+static inline void send_prepared_request_branches(
+		struct cell *cell, int retransmit)
+{
+	int branch_ret;
+	int i;
+	branch_bm_t added_branches = 1;
+
+	/* similar t_forward_nonack() - DNS failover can append branches */
+	for(i = 0; i < cell->nr_of_outgoings; i++) {
+		if(added_branches & (1 << i)) {
+			branch_ret = send_prepared_request_impl(
+					&cell->uac[i].request, retransmit, i);
+			if(branch_ret > i) {
+				/* DNS fallback branch was added. */
+				added_branches |= 1 << branch_ret;
+			}
+		}
+	}
+}
+
 void send_prepared_request(struct retr_buf *request)
 {
-	send_prepared_request_impl(request, 1 /* retransmit */, 0);
+	struct cell *cell;
+
+	if(unlikely(request == NULL)) {
+		LM_ERR("null prepared request\n");
+		return;
+	}
+
+	cell = request->my_T;
+	if(unlikely(cell == NULL)) {
+		LM_BUG("prepared request has no transaction\n");
+		return;
+	}
+
+	send_prepared_request_branches(cell, 1 /* retransmit */);
+	UNREF(cell);
 }
 
 /*
@@ -828,9 +882,6 @@ int t_uac_with_ids(
 	struct cell *cell;
 	int ret;
 	int is_ack;
-	int branch_ret;
-	int i;
-	branch_bm_t added_branches = 1;
 
 	ret = t_uac_prepare(uac_r, &request, &cell);
 
@@ -847,19 +898,7 @@ int t_uac_with_ids(
 					 ? 1
 					 : 0;
 
-	/* equivalent loop to the one in t_forward_nonack */
-	for(i = 0; i < cell->nr_of_outgoings; i++) {
-		if(added_branches & (1 << i)) {
-			branch_ret = send_prepared_request_impl(
-					request, !is_ack /* retransmit */, i);
-			if(branch_ret >= 0) { /* some kind of success */
-				if(branch_ret > i) {
-					/* new branch added */
-					added_branches |= 1 << branch_ret;
-				}
-			}
-		}
-	}
+	send_prepared_request_branches(cell, !is_ack /* retransmit */);
 
 	if(is_ack) {
 		free_cell(cell);
@@ -869,6 +908,9 @@ int t_uac_with_ids(
 		if(ret_index && ret_label) {
 			*ret_index = cell->hash_index;
 			*ret_label = cell->label;
+		}
+		if(likely(cell != NULL)) {
+			UNREF(cell);
 		}
 	}
 	return ret;
@@ -912,7 +954,7 @@ struct retr_buf *local_ack_rb(sip_msg_t *rpl_2xx, struct cell *trans,
 #ifdef WITH_EVENT_LOCAL_REQUEST
 	dlg = (dlg_t *)shm_malloc(sizeof(dlg_t));
 	if(dlg == 0) {
-		SHM_MEM_ERROR_FMT("required (%lu)\n", sizeof(dlg_t));
+		SHM_MEM_ERROR_FMT("required (%lu)\n", (unsigned long)sizeof(dlg_t));
 		return NULL;
 	}
 	memset(dlg, 0, sizeof(dlg_t));
@@ -1181,8 +1223,16 @@ int req_outside(uac_req_t *uac_r, str *ruri, str *to, str *from, str *next_hop)
 	if(check_params(uac_r, to, from) < 0)
 		goto err;
 
-	generate_callid(&callid);
-	generate_fromtag(&fromtag, &callid, ruri);
+	if(uac_r->callid == NULL || uac_r->callid->len <= 0) {
+		generate_callid(&callid);
+	} else {
+		callid = *uac_r->callid;
+	}
+	if(uac_r->fromtag == NULL || uac_r->fromtag->len <= 0) {
+		generate_fromtag(&fromtag, &callid, ruri);
+	} else {
+		fromtag = *uac_r->fromtag;
+	}
 
 	if(new_dlg_uac(&callid, &fromtag, DEFAULT_CSEQ, from, to, &uac_r->dialog)
 			< 0) {

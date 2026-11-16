@@ -36,6 +36,7 @@
 #include "../../core/parser/contact/parse_contact.h"
 #include "../../core/parser/parse_to.h"
 #include "../../core/parser/parse_from.h"
+#include "../../core/parser/parse_rr.h"
 
 #define UNSUPPORTED_HEADER "Unsupported: "
 #define UNSUPPORTED_HEADER_LEN (sizeof(UNSUPPORTED_HEADER) - 1)
@@ -136,7 +137,7 @@ int sanity_reply(sip_msg_t *msg, int code, char *reason)
 int str2valid_uint(str *_number, unsigned int *_result)
 {
 	int i;
-	int result = 0;
+	unsigned int result = 0;
 	int equal = 1;
 	char mui[10] = "4294967296";
 
@@ -314,7 +315,7 @@ int check_ruri_scheme(sip_msg_t *msg)
 		if((_hf)->type == _hdr_type) {                                        \
 			if(_hdr_flags & _hdr_flag) {                                      \
 				LM_DBG("duplicated %s header\n", _hdr_name);                  \
-				return SANITY_CHECK_FAILED;                                   \
+				sanity_check_status = SANITY_CHECK_FAILED;                    \
 			}                                                                 \
 			_hdr_flags |= _hdr_flag;                                          \
 		}                                                                     \
@@ -325,6 +326,7 @@ int check_required_headers(sip_msg_t *msg)
 {
 	hdr_field_t *hf;
 	hdr_flags_t hdr_flags = 0;
+	int sanity_check_status = SANITY_CHECK_PASSED;
 
 	LM_DBG("check_required_headers entered\n");
 
@@ -341,11 +343,15 @@ int check_required_headers(sip_msg_t *msg)
 
 	if(parse_headers(msg, HDR_EOH_F, 0) != 0) {
 		LM_ERR("failed to parse headers\n");
-		if(sanity_reply(msg, 400, "Bad Headers") < 0) {
-			LM_WARN("failed to send 400 reply\n");
-		}
-		return SANITY_CHECK_FAILED;
+		sanity_check_status = SANITY_CHECK_FAILED;
 	}
+
+	if(msg->errored_hdrs
+			& (HDR_FROM_F | HDR_TO_F | HDR_CALLID_F | HDR_CSEQ_F)) {
+		LM_ERR("errored headers found\n");
+		sanity_check_status = SANITY_CHECK_FAILED;
+	}
+
 	for(hf = msg->headers; hf; hf = hf->next) {
 		SANITY_HDR_DUPCHECK(hf, hdr_flags, HDR_FROM_T, HDR_FROM_F, "From");
 		SANITY_HDR_DUPCHECK(hf, hdr_flags, HDR_TO_T, HDR_TO_F, "To");
@@ -354,10 +360,16 @@ int check_required_headers(sip_msg_t *msg)
 		SANITY_HDR_DUPCHECK(hf, hdr_flags, HDR_CSEQ_T, HDR_CSEQ_F, "CSeq");
 	}
 
-	/* TODO: check for other required headers according to request type */
-	LM_DBG("check_required_headers passed\n");
+	if(sanity_check_status == SANITY_CHECK_FAILED
+			&& sanity_reply(msg, 400, "Bad Headers") < 0) {
+		LM_WARN("failed to send 400 reply\n");
+	}
 
-	return SANITY_CHECK_PASSED;
+	/* TODO: check for other required headers according to request type */
+	LM_DBG("check_required_headers status: %s\n",
+			sanity_check_status ? "PASSED" : "FAILED");
+
+	return sanity_check_status;
 }
 
 /* check if the SIP version in the Via header is 2.0 */
@@ -370,22 +382,14 @@ int check_via1_header(sip_msg_t *msg)
 		return SANITY_CHECK_FAILED;
 	}
 
-	if(msg->via1->host.s == NULL || msg->via1->host.len <= 0) {
-		LM_WARN("failed to parse the Via1 host\n");
+	if(msg->via1 == NULL) {
+		LM_WARN("missing Via1 header\n");
 		msg->msg_flags |= FL_MSG_NOREPLY;
 		return SANITY_CHECK_FAILED;
 	}
 
-	return SANITY_CHECK_PASSED;
-}
-
-/* check if the Via header contains a branch parameter
-and that it starts with the magic cookie */
-int check_via1_branch(sip_msg_t *msg)
-{
-	LM_DBG("check via1 branch\n");
-	if(parse_headers(msg, HDR_VIA1_F, 0) != 0) {
-		LM_WARN("failed to parse the Via1 header\n");
+	if(msg->via1->host.s == NULL || msg->via1->host.len <= 0) {
+		LM_WARN("failed to parse the Via1 host\n");
 		msg->msg_flags |= FL_MSG_NOREPLY;
 		return SANITY_CHECK_FAILED;
 	}
@@ -396,12 +400,95 @@ int check_via1_branch(sip_msg_t *msg)
 		return SANITY_CHECK_FAILED;
 	}
 
-	if(msg->via1->branch->value.len < 7
-			|| memcmp(msg->via1->branch->value.s, "z9hG4bK", 7) != 0) {
-		LM_WARN("Via1 branch parameter does not start with the magic cookie\n");
+	return SANITY_CHECK_PASSED;
+}
+
+/* check multiple conditions regarding RFC3261
+	1. via branch parameter starts with the magic cookie
+	2. for Record-Route and Route headers check that the lr parameter is present
+*/
+int check_rfc3261_compliance(sip_msg_t *msg)
+{
+	hdr_field_t *hf;
+	rr_t *rr;
+	sip_uri_t parsed_uri;
+
+	LM_DBG("check via1 branch\n");
+	if(parse_headers(msg, HDR_VIA1_F, 0) != 0) {
+		LM_WARN("failed to parse the Via1 header\n");
 		msg->msg_flags |= FL_MSG_NOREPLY;
 		return SANITY_CHECK_FAILED;
 	}
+
+	if(msg->via1 == NULL) {
+		LM_WARN("missing Via1 header\n");
+		msg->msg_flags |= FL_MSG_NOREPLY;
+		return SANITY_CHECK_FAILED;
+	}
+
+	if(msg->via1->branch == NULL || msg->via1->branch->value.s == NULL
+			|| msg->via1->branch->value.len < 7
+			|| memcmp(msg->via1->branch->value.s, "z9hG4bK", 7) != 0) {
+		LM_WARN("Via1 branch parameter does not start with the magic cookie\n");
+		return SANITY_CHECK_FAILED;
+	}
+
+	/* Check lr parameter for Record-Route */
+	LM_DBG("check Record-Route lr parameter for all RR headers\n");
+
+	if(parse_record_route_headers(msg) != 0) {
+		LM_WARN("failed to parse the Record-Route headers\n");
+		return SANITY_CHECK_FAILED;
+	}
+
+	hf = msg->record_route;
+	while(hf) {
+		if(hf->parsed == NULL) {
+			LM_WARN("failed to parse the Record-Route header body\n");
+			return SANITY_CHECK_FAILED;
+		}
+		rr = hf->parsed;
+		if(parse_uri(rr->nameaddr.uri.s, rr->nameaddr.uri.len, &parsed_uri)
+				!= 0) {
+			LM_WARN("failed to parse the Record-Route URI\n");
+			return SANITY_CHECK_FAILED;
+		}
+
+		if(parsed_uri.lr.len == 0 || parsed_uri.lr.s == NULL) {
+			LM_WARN("missing lr parameter in Record-Route URI\n");
+			return SANITY_CHECK_FAILED;
+		}
+		hf = next_sibling_hdr(hf);
+	}
+
+	/* Check lr parameter for Route */
+	LM_DBG("check Route lr parameter for all Route headers\n");
+
+	if(parse_route_headers(msg) != 0) {
+		LM_WARN("failed to parse the Route headers\n");
+		return SANITY_CHECK_FAILED;
+	}
+
+	hf = msg->route;
+	while(hf) {
+		if(hf->parsed == NULL) {
+			LM_WARN("failed to parse the Route header body\n");
+			return SANITY_CHECK_FAILED;
+		}
+		rr = hf->parsed;
+		if(parse_uri(rr->nameaddr.uri.s, rr->nameaddr.uri.len, &parsed_uri)
+				!= 0) {
+			LM_WARN("failed to parse the Route URI\n");
+			return SANITY_CHECK_FAILED;
+		}
+
+		if(parsed_uri.lr.len == 0 || parsed_uri.lr.s == NULL) {
+			LM_WARN("missing lr parameter in Route URI\n");
+			return SANITY_CHECK_FAILED;
+		}
+		hf = next_sibling_hdr(hf);
+	}
+
 	return SANITY_CHECK_PASSED;
 }
 
@@ -608,9 +695,8 @@ int check_cseq_value(sip_msg_t *msg)
 			}
 			return SANITY_CHECK_FAILED;
 		}
-		if(str2valid_uint(
-				   &((struct cseq_body *)msg->cseq->parsed)->number, &cseq)
-				!= 0) {
+		if(str2int(&((struct cseq_body *)msg->cseq->parsed)->number, &cseq) != 0
+				|| cseq >= (1U << 31)) {
 			if(sanity_reply(msg, 400, "CSeq number is illegal") < 0) {
 				LM_WARN("failed to send 400 via sl reply 2\n");
 			}
@@ -768,7 +854,12 @@ int check_proxy_require(sip_msg_t *msg)
 					memcpy(u + UNSUPPORTED_HEADER_LEN, r_pr->s.s, r_pr->s.len);
 					memcpy(u + UNSUPPORTED_HEADER_LEN + r_pr->s.len, CRLF,
 							CRLF_LEN);
-					add_lump_rpl(msg, u, u_len, LUMP_RPL_HDR);
+					if(add_lump_rpl(msg, u, u_len, LUMP_RPL_HDR) == 0) {
+						LM_ERR("failed to append Unsupported header to "
+							   "reply\n");
+					}
+					pkg_free(u);
+					u = NULL;
 				}
 
 				if(sanity_reply(msg, 420, "Bad Proxy Require Extension") < 0) {

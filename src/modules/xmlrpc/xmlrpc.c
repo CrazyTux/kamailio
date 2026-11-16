@@ -57,6 +57,7 @@
 #include "../../core/usr_avp.h"
 #include "../../core/mem/mem.h"
 #include "../../core/parser/parse_uri.h"
+#include "../../core/parser/parse_bytes.h"
 #include "../../core/parser/msg_parser.h"
 #include "../../core/ut.h"
 #include "../../core/dset.h"
@@ -2620,9 +2621,7 @@ static int process_xmlrpc(sip_msg_t *msg)
 	method_len = msg->first_line.u.request.method.len;
 	/* first line is always > 4, so it's always safe to try to read the
 	 * 1st 4 bytes from method, even if method is shorter*/
-	n_method = method[0] + (method[1] << 8) + (method[2] << 16)
-			   + (method[3] << 24);
-	n_method |= 0x20202020;
+	n_method = ksr_ascii_lower_u32(ksr_read_u32le((const char *)method));
 	if(method_len < 4) {
 		n_method &= ((1U << (method_len * 8)) - 1);
 	}
@@ -2676,11 +2675,15 @@ static int ki_dispatch_rpc(sip_msg_t *msg)
 	rpc_exportx_t *exp;
 	int ret = 1;
 	unsigned int rdata;
+	int lidx = -1;
+	str method;
 
 	if(init_context(&ctx, msg) < 0)
 		goto skip;
 
-	exp = rpc_lookupx(ctx.method, strlen(ctx.method), &rdata);
+	method.s = ctx.method;
+	method.len = strlen(ctx.method);
+	exp = rpc_lookupx(method.s, method.len, &rdata);
 	if(!exp || !exp->r.function) {
 		rpc_fault(&ctx, 500, "Method Not Found");
 		goto skip;
@@ -2695,6 +2698,7 @@ static int ki_dispatch_rpc(sip_msg_t *msg)
 	if((exp->r.flags & RET_ARRAY)
 			&& add_xmlrpc_reply(&ctx.reply, &array_prefix) < 0)
 		goto skip;
+	lidx = ksr_rpc_exec_locks_set_get(&method);
 	exp->r.function(&func_param, &ctx);
 
 skip:
@@ -2702,6 +2706,7 @@ skip:
 	if(!ctx.reply_sent && !(ctx.flags & XMLRPC_DELAYED_REPLY_F)) {
 		ret = rpc_send(&ctx);
 	}
+	ksr_rpc_exec_locks_set_release_idx(lidx);
 	clean_context(&ctx);
 	collect_garbage();
 	if(ret < 0)

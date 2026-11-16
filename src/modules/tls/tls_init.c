@@ -63,6 +63,7 @@
 #include "tls_locking.h"
 #include "tls_ct_wrq.h"
 #include "tls_cfg.h"
+#include "tls_openssl.h"
 
 /* will be set to 1 when the TLS env is initialized to make destroy safe */
 static int tls_mod_preinitialized = 0;
@@ -174,6 +175,11 @@ sr_tls_methods_t sr_tls_methods[TLS_METHOD_MAX];
 #undef TLS_MALLOC_DBG /* extra malloc debug info from openssl */
 #endif				  /* NO_TLS_MALLOC_DBG */
 
+/* mode 0: libssl allocates from shm through these hooks */
+#ifndef KSR_TLS_LIBSSL_COMPAT
+#define KSR_TLS_MEM_HOOKS
+#endif
+
 /*
  * Wrappers around SER shared memory functions
  * (which can be macros)
@@ -188,7 +194,7 @@ sr_tls_methods_t sr_tls_methods[TLS_METHOD_MAX];
 */
 
 
-#ifndef LIBRESSL_VERSION_NUMBER
+#ifdef KSR_TLS_MEM_HOOKS
 inline static char *buf_append(char *buf, char *end, char *str, int str_len)
 {
 	if((buf + str_len) < end) {
@@ -335,11 +341,11 @@ static void ser_free(void *ptr, const char *fname, int fline)
 	}
 }
 
-#endif /* LIBRESSL_VERSION_NUMBER */
+#endif /* KSR_TLS_MEM_HOOKS */
 
 #else /*TLS_MALLOC_DBG */
 
-#ifndef LIBRESSL_VERSION_NUMBER
+#ifdef KSR_TLS_MEM_HOOKS
 
 #if OPENSSL_VERSION_NUMBER < 0x010100000L
 static void *ser_malloc(size_t size)
@@ -374,8 +380,6 @@ static void *ser_realloc(void *ptr, size_t size, const char *fname, int fline)
 }
 #endif
 
-#endif
-
 #if OPENSSL_VERSION_NUMBER < 0x010100000L
 static void ser_free(void *ptr)
 {
@@ -399,7 +403,9 @@ static void ser_free(void *ptr, const char *fname, int fline)
 }
 #endif
 
-#endif /* LIBRESSL_VERSION_NUMBER */
+#endif /* KSR_TLS_MEM_HOOKS */
+
+#endif /* TLS_MALLOC_DBG */
 
 /*
  * Initialize TLS socket
@@ -444,7 +450,7 @@ static void init_ssl_methods(void)
 	ssl_methods[TLS_USE_SSLv23 - 1] = SSLv23_method();
 
 	/* only specific SSL or TLS version */
-#if OPENSSL_VERSION_NUMBER < 0x010100000L || defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER < 0x010100000L
 #ifndef OPENSSL_NO_SSL2
 	ssl_methods[TLS_USE_SSLv2_cli - 1] = SSLv2_client_method();
 	ssl_methods[TLS_USE_SSLv2_srv - 1] = SSLv2_server_method();
@@ -462,13 +468,13 @@ static void init_ssl_methods(void)
 	ssl_methods[TLS_USE_TLSv1_srv - 1] = TLSv1_server_method();
 	ssl_methods[TLS_USE_TLSv1 - 1] = TLSv1_method();
 
-#if OPENSSL_VERSION_NUMBER >= 0x1000100fL && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x1000100fL
 	ssl_methods[TLS_USE_TLSv1_1_cli - 1] = TLSv1_1_client_method();
 	ssl_methods[TLS_USE_TLSv1_1_srv - 1] = TLSv1_1_server_method();
 	ssl_methods[TLS_USE_TLSv1_1 - 1] = TLSv1_1_method();
 #endif
 
-#if OPENSSL_VERSION_NUMBER >= 0x1000105fL && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x1000105fL
 	ssl_methods[TLS_USE_TLSv1_2_cli - 1] = TLSv1_2_client_method();
 	ssl_methods[TLS_USE_TLSv1_2_srv - 1] = TLSv1_2_server_method();
 	ssl_methods[TLS_USE_TLSv1_2 - 1] = TLSv1_2_method();
@@ -477,11 +483,11 @@ static void init_ssl_methods(void)
 	/* ranges of TLS versions (require a minimum TLS version) */
 	ssl_methods[TLS_USE_TLSv1_PLUS - 1] = (void *)TLS_OP_TLSv1_PLUS;
 
-#if OPENSSL_VERSION_NUMBER >= 0x1000100fL && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x1000100fL
 	ssl_methods[TLS_USE_TLSv1_1_PLUS - 1] = (void *)TLS_OP_TLSv1_1_PLUS;
 #endif
 
-#if OPENSSL_VERSION_NUMBER >= 0x1000105fL && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x1000105fL
 	ssl_methods[TLS_USE_TLSv1_2_PLUS - 1] = (void *)TLS_OP_TLSv1_2_PLUS;
 #endif
 
@@ -536,7 +542,7 @@ static void init_ssl_methods(void)
 	sr_tls_methods[TLS_USE_TLSv1_2 - 1].TLSMethodMin = TLS1_2_VERSION;
 	sr_tls_methods[TLS_USE_TLSv1_2 - 1].TLSMethodMax = TLS1_2_VERSION;
 
-#if OPENSSL_VERSION_NUMBER >= 0x1010100fL && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x1010100fL
 	sr_tls_methods[TLS_USE_TLSv1_3_cli - 1].TLSMethod = TLS_client_method();
 	sr_tls_methods[TLS_USE_TLSv1_3_cli - 1].TLSMethodMin = TLS1_3_VERSION;
 	sr_tls_methods[TLS_USE_TLSv1_3_cli - 1].TLSMethodMax = TLS1_3_VERSION;
@@ -558,7 +564,7 @@ static void init_ssl_methods(void)
 	sr_tls_methods[TLS_USE_TLSv1_2_PLUS - 1].TLSMethod = TLS_method();
 	sr_tls_methods[TLS_USE_TLSv1_2_PLUS - 1].TLSMethodMin = TLS1_2_VERSION;
 
-#if OPENSSL_VERSION_NUMBER >= 0x1010100fL && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x1010100fL
 	sr_tls_methods[TLS_USE_TLSv1_3_PLUS - 1].TLSMethod = TLS_method();
 	sr_tls_methods[TLS_USE_TLSv1_3_PLUS - 1].TLSMethodMin = TLS1_3_VERSION;
 #endif
@@ -572,7 +578,6 @@ static void init_ssl_methods(void)
  */
 static int init_tls_compression(void)
 {
-#ifndef LIBRESSL_VERSION_NUMBER
 #if OPENSSL_VERSION_NUMBER < 0x010100000L
 #if OPENSSL_VERSION_NUMBER >= 0x00908000L
 	int n, r;
@@ -656,7 +661,6 @@ static int init_tls_compression(void)
 end:
 #endif /* OPENSSL_VERSION_NUMBER >= 0.9.8 */
 #endif /* OPENSSL_VERSION_NUMBER < 1.1.0 */
-#endif /* LIBRESSL_VERSION_NUMBER */
 	return 0;
 }
 
@@ -667,7 +671,7 @@ end:
  */
 int tls_pre_init(void)
 {
-#ifndef LIBRESSL_VERSION_NUMBER
+#ifdef KSR_TLS_MEM_HOOKS
 #if OPENSSL_VERSION_NUMBER < 0x010100000L
 	void *(*mf)(size_t) = NULL;
 	void *(*rf)(void *, size_t) = NULL;
@@ -720,8 +724,8 @@ int tls_pre_init(void)
 		}
 		LM_DBG("updated memory functions - malloc: %p realloc: %p free: %p\n",
 				ser_malloc, ser_realloc, ser_free);
-#endif /* LIBRESSL_VERSION_NUMBER */
 	}
+#endif /* KSR_TLS_MEM_HOOKS */
 
 	if(tls_init_locks() < 0)
 		return -1;
@@ -793,7 +797,7 @@ int tls_h_mod_pre_init_f(void)
 		return -1;
 	}
 	LM_DBG("preparing tls env for modules initialization\n");
-#if OPENSSL_VERSION_NUMBER >= 0x010100000L && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x010100000L
 	LM_DBG("preparing tls env for modules initialization (libssl >=1.1)\n");
 #if OPENSSL_VERSION_NUMBER < 0x010100000L
 	OPENSSL_init_ssl(0, NULL);
@@ -834,7 +838,7 @@ int tls_h_mod_init_f(void)
 	/*struct socket_info* si;*/
 	long ssl_version;
 	const char *ssl_version_txt;
-#if OPENSSL_VERSION_NUMBER < 0x010100000L && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER < 0x010100000L
 	int lib_kerberos;
 	int lib_zlib;
 	int kerberos_support;
@@ -886,7 +890,7 @@ int tls_h_mod_init_f(void)
 	}
 
 	/* check kerberos support using compile flags only for version < 1.1.0 */
-#if OPENSSL_VERSION_NUMBER < 0x010100000L && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER < 0x010100000L
 
 #ifdef TLS_KERBEROS_SUPPORT
 	kerberos_support = 1;
@@ -1063,7 +1067,7 @@ void tls_h_mod_destroy_f(void)
 	tls_destroy_cfg();
 	tls_destroy_locks();
 	tls_ct_wq_destroy();
-#if OPENSSL_VERSION_NUMBER >= 0x010100000L && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x010100000L
 	/* explicit execution of libssl cleanup to avoid being executed again
 	 * by atexit(), when shm is gone */
 	LM_DBG("executing openssl v1.1+ cleanup\n");

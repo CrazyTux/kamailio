@@ -82,12 +82,16 @@ char *tls_ca_path = NULL; // certificate authority dir path, defaults to NULL
 static char *memory_manager = "shm";
 extern int curl_memory_manager;
 unsigned int default_authmethod = CURLAUTH_BASIC | CURLAUTH_DIGEST;
+unsigned int default_max_reply_size = 0;
 
 static int mod_init(void);
 static int child_init(int);
 static void mod_destroy(void);
 
 static int w_http_async_query(sip_msg_t *msg, char *query, char *rt);
+static int w_http_async_send(sip_msg_t *msg, char *query, char *rt);
+static int w_http_async_send_xdata(
+		sip_msg_t *msg, char *query, char *rt, char *xdata);
 static int set_query_param(str *param, str input);
 
 /* pv api binding */
@@ -110,6 +114,8 @@ static int ah_parse_time_name(pv_spec_p sp, str *in);
 static int ah_set_req(
 		struct sip_msg *msg, pv_param_t *param, int op, pv_value_t *val);
 static int ah_get_id(struct sip_msg *msg, pv_param_t *param, pv_value_t *res);
+static int ah_get_xdata(
+		struct sip_msg *msg, pv_param_t *param, pv_value_t *res);
 
 
 static str pv_str_1 = {"1", 1};
@@ -146,7 +152,9 @@ enum http_req_name_t
 	E_HRN_TCP_KA,
 	E_HRN_TCP_KA_IDLE,
 	E_HRN_TCP_KA_INTERVAL,
-	E_HRN_FOLLOW_REDIRECT
+	E_HRN_FOLLOW_REDIRECT,
+	E_HRN_HTTP_VERSION,
+	E_HRN_MAX_REPLY_SIZE
 };
 
 enum http_time_name_t
@@ -164,6 +172,10 @@ enum http_time_name_t
 static cmd_export_t cmds[] = {
 	{"http_async_query", (cmd_function)w_http_async_query, 2,
 			fixup_spve_spve, fixup_free_spve_spve, ANY_ROUTE},
+	{"http_async_send", (cmd_function)w_http_async_send, 2,
+			fixup_spve_spve, fixup_free_spve_spve, ANY_ROUTE},
+	{"http_async_send_xdata", (cmd_function)w_http_async_send_xdata, 3,
+			fixup_spve_all, fixup_free_spve_all, ANY_ROUTE},
 	{0, 0, 0, 0, 0, 0}
 };
 
@@ -184,6 +196,7 @@ static param_export_t params[] = {
 	{"tcp_keepalive", PARAM_INT, &tcp_keepalive},
 	{"tcp_ka_idle", PARAM_INT, &tcp_ka_idle},
 	{"tcp_ka_interval", PARAM_INT, &tcp_ka_interval},
+	{"max_reply_size", PARAM_INT, &default_max_reply_size},
 	{0, 0, 0}
 };
 
@@ -210,6 +223,7 @@ static pv_export_t pvs[] = {
 	{STR_STATIC_INIT("http_req"), PVT_OTHER, pv_get_null, ah_set_req,
 			ah_parse_req_name, 0, 0, 0},
 	{STR_STATIC_INIT("http_req_id"), PVT_OTHER, ah_get_id, 0, 0, 0, 0, 0},
+	{STR_STATIC_INIT("http_xdata"), PVT_OTHER, ah_get_xdata, 0, 0, 0, 0, 0},
 	{{0, 0}, 0, 0, 0, 0, 0, 0, 0}
 };
 
@@ -424,7 +438,77 @@ static int w_http_async_query(sip_msg_t *msg, char *query, char *rt)
 		LM_ERR("invalid route name parameter\n");
 		return -1;
 	}
-	return async_send_query(msg, &sdata, &rn);
+	return async_send_query(msg, &sdata, &rn, AH_SUSPEND_CFG);
+}
+
+/**
+ *
+ */
+static int w_http_async_send(sip_msg_t *msg, char *query, char *rt)
+{
+	str sdata;
+	str rn;
+
+	if(msg == NULL)
+		return -1;
+
+	if(fixup_get_svalue(msg, (gparam_t *)query, &sdata) != 0) {
+		LM_ERR("unable to get data\n");
+		return -1;
+	}
+	if(sdata.s == NULL || sdata.len == 0) {
+		LM_ERR("invalid data parameter\n");
+		return -1;
+	}
+
+	if(fixup_get_svalue(msg, (gparam_t *)rt, &rn) != 0) {
+		LM_ERR("no route block name\n");
+		return -1;
+	}
+	if(rn.s == NULL || rn.len == 0) {
+		LM_ERR("invalid route name parameter\n");
+		return -1;
+	}
+	return async_send_query(msg, &sdata, &rn, AH_SUSPEND_NONE);
+}
+
+/**
+ *
+ */
+static int w_http_async_send_xdata(
+		sip_msg_t *msg, char *query, char *rt, char *xdata)
+{
+	str sdata;
+	str rn;
+	str sxdata;
+
+	if(msg == NULL)
+		return -1;
+
+	if(fixup_get_svalue(msg, (gparam_t *)query, &sdata) != 0) {
+		LM_ERR("unable to get data\n");
+		return -1;
+	}
+	if(sdata.s == NULL || sdata.len == 0) {
+		LM_ERR("invalid data parameter\n");
+		return -1;
+	}
+
+	if(fixup_get_svalue(msg, (gparam_t *)rt, &rn) != 0) {
+		LM_ERR("no route block name\n");
+		return -1;
+	}
+	if(rn.s == NULL || rn.len == 0) {
+		LM_ERR("invalid route name parameter\n");
+		return -1;
+	}
+
+	if(fixup_get_svalue(msg, (gparam_t *)xdata, &sxdata) != 0) {
+		LM_ERR("unable to get xdata\n");
+		return -1;
+	}
+
+	return async_send_query_xdata(msg, &sdata, &rn, AH_SUSPEND_NONE, &sxdata);
 }
 
 /**
@@ -442,7 +526,44 @@ static int ki_http_async_query(sip_msg_t *msg, str *sdata, str *rn)
 		LM_ERR("invalid route name parameter\n");
 		return -1;
 	}
-	return async_send_query(msg, sdata, rn);
+	return async_send_query(msg, sdata, rn, AH_SUSPEND_CFG);
+}
+
+/**
+ *
+ */
+static int ki_http_async_send(sip_msg_t *msg, str *sdata, str *rn)
+{
+	if(msg == NULL)
+		return -1;
+	if(sdata == NULL || sdata->len <= 0) {
+		LM_ERR("invalid data parameter\n");
+		return -1;
+	}
+	if(rn->s == NULL || rn->len <= 0) {
+		LM_ERR("invalid route name parameter\n");
+		return -1;
+	}
+	return async_send_query(msg, sdata, rn, AH_SUSPEND_NONE);
+}
+
+/**
+ *
+ */
+static int ki_http_async_send_xdata(
+		sip_msg_t *msg, str *sdata, str *rn, str *xdata)
+{
+	if(msg == NULL)
+		return -1;
+	if(sdata == NULL || sdata->len <= 0) {
+		LM_ERR("invalid data parameter\n");
+		return -1;
+	}
+	if(rn->s == NULL || rn->len <= 0) {
+		LM_ERR("invalid route name parameter\n");
+		return -1;
+	}
+	return async_send_query_xdata(msg, sdata, rn, AH_SUSPEND_NONE, xdata);
 }
 
 #define _IVALUE_ERROR(NAME) \
@@ -537,6 +658,20 @@ static int w_pv_parse_hdr_name(pv_spec_p sp, str *in)
 static int ah_get_id(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 {
 	return pv_get_strlval(msg, param, res, q_id, strlen(q_id));
+}
+
+static int ah_get_xdata(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
+{
+	if(ah_reply) {
+		if(ah_xdata.s != NULL && ah_xdata.len > 0) {
+			return pv_get_strval(msg, param, res, &ah_xdata);
+		}
+		return pv_get_null(msg, param, res);
+	} else {
+		LM_ERR("the async variables can only be read from an async http "
+			   "worker\n");
+		return pv_get_null(msg, param, res);
+	}
 }
 
 static int ah_get_ok(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
@@ -656,9 +791,17 @@ static int ah_parse_req_name(pv_spec_p sp, str *in)
 			else
 				goto error;
 			break;
+		case 12:
+			if(strncmp(in->s, "http_version", 12) == 0)
+				sp->pvp.pvn.u.isname.name.n = E_HRN_HTTP_VERSION;
+			else
+				goto error;
+			break;
 		case 14:
 			if(strncmp(in->s, "tls_client_key", 14) == 0)
 				sp->pvp.pvn.u.isname.name.n = E_HRN_TLS_CLIENT_KEY;
+			else if(strncmp(in->s, "max_reply_size", 14) == 0)
+				sp->pvp.pvn.u.isname.name.n = E_HRN_MAX_REPLY_SIZE;
 			else
 				goto error;
 			break;
@@ -918,6 +1061,36 @@ static int ah_set_req(
 				ah_params.follow_redirect = curl_follow_redirect;
 			}
 			break;
+		case E_HRN_HTTP_VERSION:
+			if(tval) {
+				if(!(tval->flags & PV_VAL_INT)) {
+					LM_ERR("invalid value type for $http_req(http_version)\n");
+					return -1;
+				}
+				if(tval->ri < 0 || tval->ri > 2) {
+					LM_ERR("invalid value for $http_req(http_version): %ld "
+						   "(0=default, 1=HTTP/2 upgrade, "
+						   "2=HTTP/2 prior knowledge)\n",
+							tval->ri);
+					return -1;
+				}
+				ah_params.http_version = tval->ri;
+			} else {
+				ah_params.http_version = 0;
+			}
+			break;
+		case E_HRN_MAX_REPLY_SIZE:
+			if(tval) {
+				if(!(tval->flags & PV_VAL_INT)) {
+					LM_ERR("invalid value type for "
+						   "$http_req(max_reply_size)\n");
+					return -1;
+				}
+				ah_params.max_reply_size = (unsigned int)tval->ri;
+			} else {
+				ah_params.max_reply_size = default_max_reply_size;
+			}
+			break;
 	}
 
 	return 1;
@@ -931,6 +1104,16 @@ static sr_kemi_t sr_kemi_http_async_client_exports[] = {
 	{ str_init("http_async_client"), str_init("query"),
 		SR_KEMIP_INT, ki_http_async_query,
 		{ SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("http_async_client"), str_init("send"),
+		SR_KEMIP_INT, ki_http_async_send,
+		{ SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("http_async_client"), str_init("send_xdata"),
+		SR_KEMIP_INT, ki_http_async_send_xdata,
+		{ SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
 

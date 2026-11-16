@@ -553,8 +553,13 @@ static int read_line(char **b, int *read, struct readline_handle *rh)
 		/* end, nothing more to read */
 		return -1;
 	}
-	for(eol = rh->crt; (eol < rh->end) && (*eol != '\n'); eol++)
+	for(eol = rh->crt; (eol < rh->end) && (*eol != '\n') && (*eol != '\r');
+			eol++)
 		;
+	if(eol >= rh->end) {
+		/* request buffer ended without a line delimiter */
+		return -1;
+	}
 	*eol = 0;
 	trim = eol;
 	/* trim spaces at the end */
@@ -737,6 +742,8 @@ int fifo_process(char *msg_buf, int size, int *bytes_needed, void *sh,
 	int req_size;
 	static rpc_ctx_t context;
 	unsigned int rdata;
+	int lidx = -1;
+	str method;
 
 	log_prefix_set(NULL);
 	DBG("process_fifo: called with %d bytes, offset %d: %.*s\n", size,
@@ -820,7 +827,9 @@ process:
 	/* make command zero-terminated */
 	*file_sep = 0;
 
-	exp = rpc_lookupx(context.method, strlen(context.method), &rdata);
+	method.s = context.method;
+	method.len = strlen(context.method);
+	exp = rpc_lookupx(method.s, method.len, &rdata);
 	if((exp == NULL) || (exp->r.function == NULL)) {
 		DBG("Command %s not found\n", context.method);
 		rpc_fault(&context, 500, "Command '%s' not found", context.method);
@@ -833,12 +842,14 @@ process:
 		goto consume;
 	}
 
+	lidx = ksr_rpc_exec_locks_set_get(&method);
 	exp->r.function(&func_param, &context);
 
 consume:
 	if(!context.reply_sent) {
 		rpc_send(&context);
 	}
+	ksr_rpc_exec_locks_set_release_idx(lidx);
 
 	if(context.reply_file) {
 		ctl_free(context.reply_file);
@@ -1155,7 +1166,7 @@ static int print_value(rpc_ctx_t *ctx, char fmt, va_list *ap)
 		case 'f':
 			str_val.s = buf;
 			str_val.len = snprintf(buf, 256, "%f", va_arg(*ap, double));
-			if(str_val.len < 0) {
+			if(str_val.len < 0 || str_val.len >= (int)sizeof(buf)) {
 				rpc_fault(ctx, 400, "Error While Converting double");
 				ERR("Error while converting double\n");
 				goto err;
@@ -1546,7 +1557,7 @@ static int rpc_struct_add(struct text_chunk *s, char *fmt, ...)
 				case 'f':
 					st.s = buf;
 					st.len = snprintf(buf, 256, "%f", va_arg(ap, double));
-					if(st.len < 0) {
+					if(st.len < 0 || st.len >= (int)sizeof(buf)) {
 						rpc_fault(ctx, 400, "Error While Converting double");
 						ERR("Error while converting double\n");
 						goto err;

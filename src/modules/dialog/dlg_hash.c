@@ -406,6 +406,8 @@ void destroy_dlg(struct dlg_cell *dlg)
 	if(dlg->toroute_name.s)
 		shm_free(dlg->toroute_name.s);
 
+	if(dlg->dmq_node_uri.s)
+		shm_free(dlg->dmq_node_uri.s);
 
 	while(dlg->vars) {
 		var = dlg->vars;
@@ -478,6 +480,7 @@ struct dlg_cell *build_new_dlg(
 	memset(dlg, 0, len);
 	dlg->state = DLG_STATE_UNCONFIRMED;
 	dlg->init_ts = ksr_time_uint(NULL, NULL);
+	dlg->last_modified = ksr_time_uint(NULL, NULL);
 
 	dlg->h_entry = core_hash(callid, 0, d_table->size);
 	LM_DBG("new dialog on hash %u\n", dlg->h_entry);
@@ -534,6 +537,8 @@ int dlg_set_leg_info(struct dlg_cell *dlg, str *tag, str *rr, str *contact,
 		cs = *cseq;
 	}
 
+	dlg_cell_lock(dlg);
+
 	if(dlg->tag[leg].s)
 		shm_free(dlg->tag[leg].s);
 	dlg->tag[leg].s = (char *)shm_malloc(tag->len);
@@ -585,6 +590,7 @@ int dlg_set_leg_info(struct dlg_cell *dlg, str *tag, str *rr, str *contact,
 			dlg->route_set[leg].s = NULL;
 		}
 
+		dlg_cell_unlock(dlg);
 		return -1;
 	}
 
@@ -593,8 +599,8 @@ int dlg_set_leg_info(struct dlg_cell *dlg, str *tag, str *rr, str *contact,
 	memcpy(dlg->tag[leg].s, tag->s, tag->len);
 
 	/* rr */
+	dlg->route_set[leg].len = rr->len;
 	if(rr->len) {
-		dlg->route_set[leg].len = rr->len;
 		memcpy(dlg->route_set[leg].s, rr->s, rr->len);
 	}
 
@@ -611,6 +617,7 @@ int dlg_set_leg_info(struct dlg_cell *dlg, str *tag, str *rr, str *contact,
 	dlg->cseq[leg].len = cs.len;
 	memcpy(dlg->cseq[leg].s, cs.s, cs.len);
 
+	dlg_cell_unlock(dlg);
 	return 0;
 }
 
@@ -1254,6 +1261,10 @@ void next_state_dlg(
 								dlg->tag[DLG_CALLEE_LEG].s);
 						break;
 					}
+					/* don't revive a dialog torn down by a dmq peer */
+					if(dlg->dflags & DLG_FLAG_DMQ_DELETED) {
+						break;
+					}
 					ref_dlg_unsafe(dlg, 1);
 				case DLG_STATE_UNCONFIRMED:
 				case DLG_STATE_EARLY:
@@ -1276,6 +1287,12 @@ void next_state_dlg(
 				case DLG_STATE_DELETED:
 					break;
 				default:
+					/* if dmq replicated dialog received ACK */
+					if((dlg->iflags & DLG_IFLAG_DMQ_SYNC)
+							&& !(dlg->dflags & DLG_FLAG_TM)) {
+						dlg->state = DLG_STATE_CONFIRMED;
+						break;
+					}
 					log_next_state_dlg(event, dlg);
 			}
 			break;
@@ -1291,6 +1308,14 @@ void next_state_dlg(
 				case DLG_STATE_DELETED:
 					break;
 				default:
+					/* if dmq replicated dialog received BYE in unconfirmed state */
+					if((dlg->iflags & DLG_IFLAG_DMQ_SYNC)
+							&& !(dlg->dflags & DLG_FLAG_TM)) {
+						dlg->dflags |= DLG_FLAG_HASBYE;
+						dlg->state = DLG_STATE_DELETED;
+						*unref = 1;
+						break;
+					}
 					log_next_state_dlg(event, dlg);
 			}
 			break;
@@ -1327,6 +1352,8 @@ void next_state_dlg(
 					dlg->tag[DLG_CALLEE_LEG].len, dlg->tag[DLG_CALLEE_LEG].s);
 	}
 	*new_state = dlg->state;
+
+	dlg->last_modified = ksr_time_uint(NULL, NULL);
 
 	/* remove the dialog from profiles when is not no longer active */
 	if(*new_state == DLG_STATE_DELETED && dlg->profile_links != NULL

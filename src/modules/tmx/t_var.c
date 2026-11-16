@@ -27,6 +27,8 @@
 
 #include "../../core/mem/mem.h"
 #include "../../core/dset.h"
+#include "../../core/kemi.h"
+#include "../../core/route.h"
 
 #include "tmx_mod.h"
 #include "t_var.h"
@@ -46,11 +48,53 @@ static struct _pv_tmx_data _pv_treq;
 static struct _pv_tmx_data _pv_trpl;
 static struct _pv_tmx_data _pv_tinv;
 
+static void pv_t_var_free(void *p)
+{
+	pv_name_t *pvn = NULL;
+
+	if(p == NULL)
+		return;
+
+	pvn = (pv_name_t *)p;
+	if(pvn->u.dname != NULL) {
+		pv_spec_free((pv_spec_t *)pvn->u.dname);
+		pvn->u.dname = NULL;
+	}
+}
+
 void pv_tmx_data_init(void)
 {
 	memset(&_pv_treq, 0, sizeof(struct _pv_tmx_data));
 	memset(&_pv_trpl, 0, sizeof(struct _pv_tmx_data));
 	memset(&_pv_tinv, 0, sizeof(struct _pv_tmx_data));
+}
+
+void pv_tmx_data_free(void)
+{
+	if(_pv_treq.buf) {
+		if(_pv_treq.tmsgp)
+			free_sip_msg(&_pv_treq.msg);
+		pkg_free(_pv_treq.buf);
+		_pv_treq.buf = NULL;
+		_pv_treq.buf_size = 0;
+		_pv_treq.tmsgp = NULL;
+	}
+	if(_pv_trpl.buf) {
+		if(_pv_trpl.tmsgp)
+			free_sip_msg(&_pv_trpl.msg);
+		pkg_free(_pv_trpl.buf);
+		_pv_trpl.buf = NULL;
+		_pv_trpl.buf_size = 0;
+		_pv_trpl.tmsgp = NULL;
+	}
+	if(_pv_tinv.buf) {
+		if(_pv_tinv.tmsgp)
+			free_sip_msg(&_pv_tinv.msg);
+		pkg_free(_pv_tinv.buf);
+		_pv_tinv.buf = NULL;
+		_pv_tinv.buf_size = 0;
+		_pv_tinv.tmsgp = NULL;
+	}
 }
 
 int pv_t_copy_msg(struct sip_msg *src, struct sip_msg *dst)
@@ -386,6 +430,7 @@ int pv_parse_t_var_name(pv_spec_p sp, str *in)
 
 	sp->pvp.pvn.u.dname = (void *)pv;
 	sp->pvp.pvn.type = PV_NAME_PVAR;
+	sp->pvp.pvn.nfree = pv_t_var_free;
 	return 0;
 
 error:
@@ -659,6 +704,14 @@ int pv_get_tm_reply_last_received(
 	return 0;
 }
 
+enum t_pv_route_name
+{
+	T_PV_FAILURE_ROUTE = 11,
+	T_PV_BRANCH_ROUTE,
+	T_PV_ONREPLY_ROUTE,
+	T_PV_BRANCH_FAILURE_ROUTE
+};
+
 int pv_parse_t_name(pv_spec_p sp, str *in)
 {
 	if(sp == NULL || in == NULL || in->len <= 0)
@@ -706,8 +759,24 @@ int pv_parse_t_name(pv_spec_p sp, str *in)
 		case 12:
 			if(strncmp(in->s, "branch_index", 12) == 0)
 				sp->pvp.pvn.u.isname.name.n = 4;
+			else if(strncmp(in->s, "branch_route", 12) == 0)
+				sp->pvp.pvn.u.isname.name.n = T_PV_BRANCH_ROUTE;
 			else if(strncmp(in->s, "reply_reason", 12) == 0)
 				sp->pvp.pvn.u.isname.name.n = 10;
+			else
+				goto error;
+			break;
+		case 13:
+			if(strncmp(in->s, "failure_route", 13) == 0)
+				sp->pvp.pvn.u.isname.name.n = T_PV_FAILURE_ROUTE;
+			else if(strncmp(in->s, "onreply_route", 13) == 0)
+				sp->pvp.pvn.u.isname.name.n = T_PV_ONREPLY_ROUTE;
+			else
+				goto error;
+			break;
+		case 20:
+			if(strncmp(in->s, "branch_failure_route", 20) == 0)
+				sp->pvp.pvn.u.isname.name.n = T_PV_BRANCH_FAILURE_ROUTE;
 			else
 				goto error;
 			break;
@@ -722,6 +791,52 @@ int pv_parse_t_name(pv_spec_p sp, str *in)
 error:
 	LM_ERR("unknown PV name %.*s\n", in->len, in->s);
 	return -1;
+}
+
+static int pv_get_t_route_name(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *res, int route_idx, struct route_list *rt,
+		int is_branch_failure_route)
+{
+	static const char branch_failure_route_prefix[] = "tm:branch-failure:";
+	struct str_hash_entry *entry;
+	str *kemi_route_name;
+	str route_name;
+	int i;
+	int is_kemi_route = 0;
+
+	if(route_idx <= 0)
+		return pv_get_null(msg, param, res);
+
+	if(sr_kemi_eng_get() != NULL) {
+		kemi_route_name = sr_kemi_cbname_lookup_idx(route_idx);
+		if(kemi_route_name == NULL || kemi_route_name->s == NULL)
+			return pv_get_null(msg, param, res);
+		route_name = *kemi_route_name;
+		is_kemi_route = 1;
+	} else {
+		for(i = 0; i < rt->names.size; i++) {
+			clist_foreach(&rt->names.table[i], entry, next)
+			{
+				if(entry->u.n == route_idx) {
+					route_name = entry->key;
+					goto found;
+				}
+			}
+		}
+		LM_ERR("route index %d not found\n", route_idx);
+		return pv_get_null(msg, param, res);
+	}
+
+found:
+	if(is_branch_failure_route && !is_kemi_route
+			&& route_name.len >= sizeof(branch_failure_route_prefix) - 1
+			&& strncmp(route_name.s, branch_failure_route_prefix,
+					   sizeof(branch_failure_route_prefix) - 1)
+					   == 0) {
+		route_name.s += sizeof(branch_failure_route_prefix) - 1;
+		route_name.len -= sizeof(branch_failure_route_prefix) - 1;
+	}
+	return pv_get_strval(msg, param, res, &route_name);
 }
 
 int pv_get_t(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
@@ -744,6 +859,20 @@ int pv_get_t(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 	t = _tmx_tmb.t_gett();
 	if(t == NULL || t == T_UNDEFINED) {
 		/* no T */
+		switch(param->pvn.u.isname.name.n) {
+			case T_PV_FAILURE_ROUTE:
+				return pv_get_t_route_name(msg, param, res,
+						_tmx_tmb.get_on_failure(), &failure_rt, 0);
+			case T_PV_BRANCH_ROUTE:
+				return pv_get_t_route_name(msg, param, res,
+						_tmx_tmb.get_on_branch(), &branch_rt, 0);
+			case T_PV_ONREPLY_ROUTE:
+				return pv_get_t_route_name(msg, param, res,
+						_tmx_tmb.get_on_reply(), &onreply_rt, 0);
+			case T_PV_BRANCH_FAILURE_ROUTE:
+				return pv_get_t_route_name(msg, param, res,
+						_tmx_tmb.get_on_branch_failure(), &event_rt, 1);
+		}
 		if(param->pvn.u.isname.name.n == 8 || param->pvn.u.isname.name.n == 9) {
 			/* id_label_n or id_index_n - attempt to create transaction */
 			if(_tmx_tmb.t_newtran(msg) < 0) {
@@ -773,6 +902,18 @@ int pv_get_t(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 			return pv_get_uintval(msg, param, res, t->label);
 		case 9:
 			return pv_get_uintval(msg, param, res, t->hash_index);
+		case T_PV_FAILURE_ROUTE:
+			return pv_get_t_route_name(
+					msg, param, res, t->on_failure, &failure_rt, 0);
+		case T_PV_BRANCH_ROUTE:
+			return pv_get_t_route_name(
+					msg, param, res, t->on_branch, &branch_rt, 0);
+		case T_PV_ONREPLY_ROUTE:
+			return pv_get_t_route_name(
+					msg, param, res, t->on_reply, &onreply_rt, 0);
+		case T_PV_BRANCH_FAILURE_ROUTE:
+			return pv_get_t_route_name(
+					msg, param, res, t->on_branch_failure, &event_rt, 1);
 		default:
 			return pv_get_uintval(msg, param, res, t->label);
 	}
@@ -846,6 +987,10 @@ int pv_get_t_branch(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 					tcx = _tmx_tmb.tm_ctx_get();
 					if(tcx == NULL)
 						return pv_get_null(msg, param, res);
+					if(tcx->branch_index < 0
+							|| tcx->branch_index >= t->nr_of_outgoings) {
+						return pv_get_null(msg, param, res);
+					}
 					return pv_get_strval(
 							msg, param, res, &t->uac[tcx->branch_index].ruid);
 					break;

@@ -20,6 +20,7 @@
  */
 
 #include <stddef.h>
+#include <limits.h>
 #include <regex.h>
 
 #include "../../core/mem/shm_mem.h"
@@ -37,6 +38,8 @@
 
 #include "ht_api.h"
 #include "ht_db.h"
+#include "ht_file.h"
+#include "ht_dmq.h"
 
 
 extern str ht_event_callback;
@@ -116,6 +119,10 @@ int keyvalue_parse_str(str *data, int type, keyvalue_t *res)
 	res->value.len = s.len;
 	res->type = type;
 	if(type == KEYVALUE_TYPE_PARAMS) {
+		if(s.len <= 0) {
+			LM_ERR("empty params value\n");
+			goto error;
+		}
 		if(s.s[s.len - 1] == ';')
 			s.len--;
 		if(parse_params(&s, CLASS_ANY, &phooks, &res->u.params) < 0) {
@@ -170,6 +177,16 @@ void ht_slot_unlock(ht_t *ht, int idx)
 		/* recursive locked => decrease lock count */
 		ht->entries[idx].rec_lock_level--;
 	}
+}
+
+/* returns current wall-clock time in milliseconds */
+static uint64_t ht_now_ms(void)
+{
+	struct timespec ts;
+	if(ksr_clock_gettime(&ts) != 0) {
+		return (uint64_t)time(NULL) * 1000;
+	}
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
 ht_cell_t *ht_cell_new(str *name, int type, int_str *val, unsigned int cellid)
@@ -255,7 +272,8 @@ ht_t *ht_get_table(str *name)
 
 int ht_add_table(str *name, int autoexp, str *dbtable, str *dbcols, int size,
 		int dbmode, int itype, int_str *ival, int updateexpire,
-		int dmqreplicate, char coldelim, char colnull, int reloadat)
+		int dmqreplicate, char coldelim, char colnull, int reloadat, str *fpath,
+		int ftype, char fdelim)
 {
 	unsigned int htid;
 	ht_t *ht;
@@ -298,7 +316,11 @@ int ht_add_table(str *name, int autoexp, str *dbtable, str *dbcols, int size,
 	ht->name = *name;
 	if(dbtable != NULL && dbtable->len > 0)
 		ht->dbtable = *dbtable;
+	if(fpath != NULL && fpath->len > 0)
+		ht->fpath = *fpath;
 	ht->dbmode = dbmode;
+	ht->ftype = ftype;
+	ht->fdelim = fdelim;
 	ht->flags = itype;
 	if(ival != NULL)
 		ht->initval = *ival;
@@ -480,11 +502,15 @@ int ht_destroy(void)
 }
 
 
-int ht_set_cell_ex(
-		ht_t *ht, str *name, int type, int_str *val, int mode, int exv)
+/* core set_cell: setlm>0 = remote gated set; outlm!=NULL = local set returning new ts */
+static int ht_set_cell_core(ht_t *ht, str *name, int type, int_str *val,
+		int mode, int exv, uint64_t setlm, uint64_t *outlm)
 {
 	unsigned int idx;
 	unsigned int hid;
+	uint64_t newlm = 0;
+	int dolm = (ht != NULL && ht->dmqreplicate > 0
+				&& (setlm > 0 || outlm != NULL));
 	ht_cell_t *it, *prev, *cell;
 	time_t now;
 
@@ -515,6 +541,30 @@ int ht_set_cell_ex(
 	while(it != NULL && it->cellid == hid) {
 		if(name->len == it->name.len
 				&& strncmp(name->s, it->name.s, name->len) == 0) {
+			/* decide the timestamp (or reject a stale remote) */
+			if(dolm) {
+				if(setlm > 0) {
+					if(setlm <= it->last_modified) {
+						/* stale write, keep current timestamp */
+						LM_DBG("LWW: skipping stale set for "
+							   "[%.*s]=>[%.*s] local=%llu incoming=%llu\n",
+								ht->name.len, ht->name.s, name->len, name->s,
+								(unsigned long long)it->last_modified,
+								(unsigned long long)setlm);
+						if(mode)
+							ht_slot_unlock(ht, idx);
+						return 0;
+					}
+					newlm = setlm;
+				} else {
+					/* new write, get timestamp */
+					newlm = ht_now_ms();
+					if(newlm <= it->last_modified)
+						newlm = it->last_modified + 1;
+				}
+				if(outlm)
+					*outlm = newlm;
+			}
 			/* update value */
 			if(it->flags & AVP_VAL_STR) {
 				if(type & AVP_VAL_STR) {
@@ -529,6 +579,8 @@ int ht_set_cell_ex(
 						} else {
 							it->expire = now + exv;
 						}
+						if(dolm)
+							it->last_modified = newlm;
 					} else {
 						/* new */
 						cell = ht_cell_new(name, type, val, hid);
@@ -538,12 +590,14 @@ int ht_set_cell_ex(
 								ht_slot_unlock(ht, idx);
 							return -1;
 						}
+						if(dolm)
+							cell->last_modified = newlm;
 						cell->next = it->next;
 						cell->prev = it->prev;
 						if(exv <= 0) {
 							HT_COPY_EXPIRE(ht, cell, now, it);
 						} else {
-							it->expire = now + exv;
+							cell->expire = now + exv;
 						}
 						if(it->prev)
 							it->prev->next = cell;
@@ -562,6 +616,8 @@ int ht_set_cell_ex(
 					} else {
 						it->expire = now + exv;
 					}
+					if(dolm)
+						it->last_modified = newlm;
 				}
 				if(mode)
 					ht_slot_unlock(ht, idx);
@@ -576,10 +632,12 @@ int ht_set_cell_ex(
 							ht_slot_unlock(ht, idx);
 						return -1;
 					}
+					if(dolm)
+						cell->last_modified = newlm;
 					if(exv <= 0) {
 						HT_COPY_EXPIRE(ht, cell, now, it);
 					} else {
-						it->expire = now + exv;
+						cell->expire = now + exv;
 					}
 
 					cell->next = it->next;
@@ -599,6 +657,8 @@ int ht_set_cell_ex(
 					} else {
 						it->expire = now + exv;
 					}
+					if(dolm)
+						it->last_modified = newlm;
 				}
 				if(mode)
 					ht_slot_unlock(ht, idx);
@@ -608,7 +668,12 @@ int ht_set_cell_ex(
 		prev = it;
 		it = it->next;
 	}
-	/* add */
+	/* add - no existing cell, nothing to compare against */
+	if(dolm) {
+		newlm = (setlm > 0) ? setlm : ht_now_ms();
+		if(outlm)
+			*outlm = newlm;
+	}
 	cell = ht_cell_new(name, type, val, hid);
 	if(cell == NULL) {
 		LM_ERR("cannot create new cell.\n");
@@ -616,6 +681,8 @@ int ht_set_cell_ex(
 			ht_slot_unlock(ht, idx);
 		return -1;
 	}
+	if(dolm)
+		cell->last_modified = newlm;
 	if(exv <= 0) {
 		cell->expire = now + ht->htexpire;
 	} else {
@@ -640,9 +707,41 @@ int ht_set_cell_ex(
 	return 0;
 }
 
+int ht_set_cell_ex(
+		ht_t *ht, str *name, int type, int_str *val, int mode, int exv)
+{
+	return ht_set_cell_core(ht, name, type, val, mode, exv, 0, NULL);
+}
+
 int ht_set_cell(ht_t *ht, str *name, int type, int_str *val, int mode)
 {
-	return ht_set_cell_ex(ht, name, type, val, mode, 0);
+	return ht_set_cell_core(ht, name, type, val, mode, 0, 0, NULL);
+}
+
+int ht_set_cell_lww(ht_t *ht, str *name, int type, int_str *val, int mode,
+		int exv, uint64_t setlm)
+{
+	return ht_set_cell_core(ht, name, type, val, mode, exv, setlm, NULL);
+}
+
+int ht_set_cell_and_replicate(ht_t *ht, str *hname, str *name, int type,
+		int_str *val, int mode, int exv)
+{
+	uint64_t lm = 0;
+	int ret;
+
+	if(ht == NULL) {
+		return -1;
+	}
+	/* local set assigns the timestamp; replicate only on success */
+	ret = ht_set_cell_core(ht, name, type, val, mode, exv, 0, &lm);
+	if(ret == 0 && ht->dmqreplicate > 0
+			&& ht_dmq_replicate_action(
+					   HT_DMQ_SET_CELL, hname, name, type, val, mode, lm)
+					   != 0) {
+		LM_ERR("dmq replication failed\n");
+	}
+	return ret;
 }
 
 static void ht_cell_unlink(ht_t *ht, int idx, ht_cell_t *it)
@@ -722,10 +821,12 @@ int ht_del_cell_confirm(ht_t *ht, str *name)
 	return 0;
 }
 
-ht_cell_t *ht_cell_value_add(ht_t *ht, str *name, int val, ht_cell_t *old)
+static ht_cell_t *ht_cell_value_add_mode(
+		ht_t *ht, str *name, int val, int init_any, int initval, ht_cell_t *old)
 {
 	unsigned int idx;
 	unsigned int hid;
+	uint64_t newlm = 0;
 	ht_cell_t *it, *prev, *cell;
 	time_t now;
 	int_str isval;
@@ -762,10 +863,10 @@ ht_cell_t *ht_cell_value_add(ht_t *ht, str *name, int val, ht_cell_t *old)
 				if(it->expire) {
 					it->expire += now;
 				}
-				if(ht->flags == PV_VAL_INT) {
+				if(ht->flags == PV_VAL_INT || init_any) {
 					/* initval is integer, use it to create a fresh entry */
 					it->flags &= ~AVP_VAL_STR;
-					it->value.n = ht->initval.n;
+					it->value.n = init_any ? initval : ht->initval.n;
 					/* increment will be done below */
 				} else {
 					ht_slot_unlock(ht, idx);
@@ -778,9 +879,26 @@ ht_cell_t *ht_cell_value_add(ht_t *ht, str *name, int val, ht_cell_t *old)
 				ht_slot_unlock(ht, idx);
 				return NULL;
 			} else {
+				if((val > 0
+						   && it->value.n
+									  > (init_any ? INT_MAX : LONG_MAX) - val)
+						|| (val < 0
+								&& it->value.n < (init_any ? INT_MIN : LONG_MIN)
+														 - val)) {
+					ht_slot_unlock(ht, idx);
+					return NULL;
+				}
 				it->value.n += val;
 				if(ht->updateexpire)
 					it->expire = now + ht->htexpire;
+				/* timestamp the inc/dec so replication converges by LWW */
+				/* stamp only on replicated tables */
+				if(ht->dmqreplicate > 0) {
+					newlm = ht_now_ms();
+					if(newlm <= it->last_modified)
+						newlm = it->last_modified + 1;
+					it->last_modified = newlm;
+				}
 				if(old != NULL) {
 					if(old->msize >= it->msize) {
 						memcpy(old, it, it->msize);
@@ -800,17 +918,29 @@ ht_cell_t *ht_cell_value_add(ht_t *ht, str *name, int val, ht_cell_t *old)
 		it = it->next;
 	}
 	/* add val if htable has an integer init value */
-	if(ht->flags != PV_VAL_INT) {
+	if(ht->flags != PV_VAL_INT && !init_any) {
 		ht_slot_unlock(ht, idx);
 		return NULL;
 	}
-	isval.n = ht->initval.n + val;
+	if((val > 0
+			   && (init_any ? (long)initval : ht->initval.n)
+						  > (init_any ? INT_MAX : LONG_MAX) - val)
+			|| (val < 0
+					&& (init_any ? (long)initval : ht->initval.n)
+							   < (init_any ? INT_MIN : LONG_MIN) - val)) {
+		ht_slot_unlock(ht, idx);
+		return NULL;
+	}
+	isval.n = (init_any ? initval : ht->initval.n) + val;
 	it = ht_cell_new(name, 0, &isval, hid);
 	if(it == NULL) {
 		LM_ERR("cannot create new cell.\n");
 		ht_slot_unlock(ht, idx);
 		return NULL;
 	}
+	/* stamp only on replicated tables */
+	if(ht->dmqreplicate > 0)
+		it->last_modified = ht_now_ms();
 	it->expire = now + ht->htexpire;
 	if(prev == NULL) {
 		if(ht->entries[idx].first != NULL) {
@@ -839,6 +969,17 @@ ht_cell_t *ht_cell_value_add(ht_t *ht, str *name, int val, ht_cell_t *old)
 
 	ht_slot_unlock(ht, idx);
 	return cell;
+}
+
+ht_cell_t *ht_cell_value_add(ht_t *ht, str *name, int val, ht_cell_t *old)
+{
+	return ht_cell_value_add_mode(ht, name, val, 0, 0, old);
+}
+
+ht_cell_t *ht_cell_value_add_init(
+		ht_t *ht, str *name, int val, int initval, ht_cell_t *old)
+{
+	return ht_cell_value_add_mode(ht, name, val, 1, initval, old);
 }
 
 
@@ -983,6 +1124,7 @@ int ht_table_spec(char *spec)
 	str name;
 	str dbtable = {0, 0};
 	str dbcols = {0, 0};
+	str fpath = {0, 0};
 	unsigned int autoexpire = 0;
 	unsigned int size = 4;
 	unsigned int dbmode = 0;
@@ -991,6 +1133,8 @@ int ht_table_spec(char *spec)
 	unsigned int reloadat = 0;
 	char coldelim = ',';
 	char colnull = '*';
+	char fdelim = '|';
+	unsigned int ftype = 0;
 	str in;
 	str tok;
 	param_t *pit = NULL;
@@ -1001,7 +1145,7 @@ int ht_table_spec(char *spec)
 		LM_ERR("shared memory was not initialized\n");
 		return -1;
 	}
-	/* parse: name=>dbtable=abc;autoexpire=123;size=123 */
+	/* parse: name=>dbtable=abc;fpath=/path;autoexpire=123;size=123 */
 	in.s = spec;
 	in.len = strlen(in.s);
 	if(keyvalue_parse_str(&in, KEYVALUE_TYPE_PARAMS, &kval) < 0) {
@@ -1018,6 +1162,20 @@ int ht_table_spec(char *spec)
 			dbtable = tok;
 			LM_DBG("htable [%.*s] - dbtable [%.*s]\n", name.len, name.s,
 					dbtable.len, dbtable.s);
+		} else if(pit->name.len == 5 && strncmp(pit->name.s, "fpath", 5) == 0) {
+			fpath = tok;
+			LM_DBG("htable [%.*s] - fpath [%.*s]\n", name.len, name.s,
+					fpath.len, fpath.s);
+		} else if(pit->name.len == 5 && strncmp(pit->name.s, "ftype", 5) == 0) {
+			if(str2int(&tok, &ftype) != 0 || ftype > 1)
+				goto error;
+			LM_DBG("htable [%.*s] - ftype [%u]\n", name.len, name.s, ftype);
+		} else if(pit->name.len == 6
+				  && strncmp(pit->name.s, "fdelim", 6) == 0) {
+			if(tok.len != 1 || tok.s[0] == '\r' || tok.s[0] == '\n')
+				goto error;
+			fdelim = tok.s[0];
+			LM_DBG("htable [%.*s] - fdelim [%c]\n", name.len, name.s, fdelim);
 		} else if(pit->name.len == 4 && strncmp(pit->name.s, "cols", 4) == 0) {
 			dbcols = tok;
 			LM_DBG("htable [%.*s] - dbcols [%.*s]\n", name.len, name.s,
@@ -1087,10 +1245,24 @@ int ht_table_spec(char *spec)
 			goto error;
 		}
 	}
+	if(fpath.len > 0 && dbtable.len > 0) {
+		LM_ERR("htable [%.*s]: fpath and dbtable cannot be used together\n",
+				name.len, name.s);
+		goto error;
+	}
+	if(ftype == 1
+			&& ((fdelim >= 'A' && fdelim <= 'Z')
+					|| (fdelim >= 'a' && fdelim <= 'z')
+					|| (fdelim >= '0' && fdelim <= '9') || fdelim == '-'
+					|| fdelim == '_' || fdelim == '=')) {
+		LM_ERR("htable [%.*s]: fdelim [%c] conflicts with base64url\n",
+				name.len, name.s, fdelim);
+		goto error;
+	}
 
 	return ht_add_table(&name, autoexpire, &dbtable, &dbcols, size, dbmode,
 			itype, &ival, updateexpire, dmqreplicate, coldelim, colnull,
-			reloadat);
+			reloadat, &fpath, ftype, fdelim);
 
 error:
 	LM_ERR("invalid htable parameter [%.*s]\n", in.len, in.s);
@@ -1185,14 +1357,16 @@ void ht_timer(unsigned int ticks, void *param)
 					if(it->expire != 0 && it->expire < now) {
 						/* expired */
 						ht_handle_expired_record(ht, it);
-						if(it->prev == NULL)
-							ht->entries[i].first = it->next;
-						else
-							it->prev->next = it->next;
-						if(it->next)
-							it->next->prev = it->prev;
-						ht->entries[i].esize--;
-						ht_cell_free(it);
+						if(it->expire < now) {
+							if(it->prev == NULL)
+								ht->entries[i].first = it->next;
+							else
+								it->prev->next = it->next;
+							if(it->next)
+								it->next->prev = it->prev;
+							ht->entries[i].esize--;
+							ht_cell_free(it);
+						}
 					}
 					it = it0;
 				}

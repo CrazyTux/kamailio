@@ -164,6 +164,43 @@ if (t_cancel_callid("123qaz", "5", "22", "200")) {
 </programlisting>
 		</example>
 	</section>
+	<section id="tmx.f.t_cancel_branch_idx">
+		<title>
+			<function moreinfo="none">t_cancel_branch_idx(tindex, tlabel, bindex)
+			</function>
+		</title>
+		<para>
+		Cancel first INVITE transaction identified by tranaction index, label
+		and branch index.
+		</para>
+		<para>
+		Parameters:.
+		</para>
+		<itemizedlist>
+			<listitem><para>
+				<emphasis>tindex</emphasis> - transaction index.
+			</para></listitem>
+			<listitem><para>
+				<emphasis>tlabel</emphasis> - transaction label.
+			</para></listitem>
+			<listitem><para>
+				<emphasis>bindex</emphasis> - branch index.
+			</para></listitem>
+		</itemizedlist>
+		<para>
+		This function can be used in ANY_ROUTE.
+		</para>
+		<example>
+		<title><function>t_cancel_branch_idx</function> usage</title>
+		<programlisting format="linespecific">
+...
+if (t_cancel_branch_idx("123", "456", "2")) {
+	xinfo("transaction branch cancelled\n");
+}
+...
+</programlisting>
+		</example>
+	</section>
 	<section id="tmx.f.t_uac_ack_local">
 		<title>
 			<function moreinfo="none">t_uac_ack_local(callid, cseq [, headers [, body]])
@@ -618,6 +655,22 @@ event_route [tm:branch-failure:contact] {
 			</para></listitem>
 			<listitem><para>
 				<emphasis>$T(name)</emphasis>
+			</para></listitem>
+			<listitem><para>
+				<emphasis>$T(failure_route)</emphasis> - name of the failure_route
+				currently armed for the transaction.
+			</para></listitem>
+			<listitem><para>
+				<emphasis>$T(branch_route)</emphasis> - name of the branch_route
+				currently armed for the transaction.
+			</para></listitem>
+			<listitem><para>
+				<emphasis>$T(onreply_route)</emphasis> - name of the onreply_route
+				currently armed for the transaction.
+			</para></listitem>
+			<listitem><para>
+				<emphasis>$T(branch_failure_route)</emphasis> - name of the
+				branch_failure_route currently armed for the transaction.
 			</para></listitem>
 		</itemizedlist>
 		<para>

@@ -31,6 +31,7 @@
 #include "../../core/pt.h"
 #include "../../core/cfg/cfg.h"
 #include "../../core/dprint.h"
+
 #include "tls_config.h"
 #include "tls_server.h"
 #include "tls_util.h"
@@ -41,6 +42,7 @@
 #include "tls_verify.h"
 #include "wolfssl_pkcs11.h"
 
+#define PROC_TCP_MAIN -4
 /*
  * needed for wolfSSL
  */
@@ -84,35 +86,8 @@ static unsigned char dh3072_g[] = {0x02};
 
 static void setup_dh(WOLFSSL_CTX *ctx)
 {
-	/*
- * not needed for OpenSSL 1.1.0+ and LibreSSL
- * DH_new() is deprecated in OpenSSL 3
- */
-	DH *dh;
-	BIGNUM *p;
-	BIGNUM *g;
-
-	dh = DH_new();
-	if(dh == NULL) {
-		return;
-	}
-
-	p = BN_bin2bn(dh3072_p, sizeof(dh3072_p), NULL);
-	g = BN_bin2bn(dh3072_g, sizeof(dh3072_g), NULL);
-
-	if(p == NULL || g == NULL) {
-		DH_free(dh);
-		return;
-	}
-
-	dh->p = p;
-	dh->g = g;
-
-
-	wolfSSL_CTX_set_options(ctx, WOLFSSL_OP_SINGLE_DH_USE);
-	wolfSSL_CTX_set_tmp_dh(ctx, dh);
-
-	DH_free(dh);
+	wolfSSL_CTX_SetTmpDH(
+			ctx, dh3072_p, sizeof(dh3072_p), dh3072_g, sizeof(dh3072_g));
 }
 
 
@@ -144,6 +119,7 @@ tls_domain_t *tls_new_domain(int type, struct ip_addr *ip, unsigned short port)
 	d->verify_depth = -1;
 	d->require_cert = -1;
 	d->verify_client = -1;
+	d->verify_server_name = -1;
 	return d;
 }
 
@@ -156,11 +132,15 @@ void tls_free_domain(tls_domain_t *d)
 {
 	if(!d)
 		return;
-	if(d->ctx && ksr_tcp_main_threads == 0) {
-		do {
-			if(d->ctx[0])
-				wolfSSL_CTX_free(d->ctx[0]);
-		} while(0);
+	if(d->ctx && wolfssl_child_rank == PROC_TCP_MAIN) {
+		if(d->ctx[0]) {
+			void *ext = wolfSSL_CTX_get_ex_data(d->ctx[0], 0);
+			if(ext) {
+				pkg_free(ext);
+			}
+
+			wolfSSL_CTX_free(d->ctx[0]);
+		}
 		shm_free(d->ctx);
 	}
 
@@ -242,7 +222,8 @@ void tls_destroy_cfg(void)
  */
 char *tls_domain_str(tls_domain_t *d)
 {
-	static char buf[1024];
+	/* per thread: mode 2 completes the TLS init on tcp reactor pool threads */
+	static _Thread_local char buf[1024];
 	char *p;
 
 	buf[0] = '\0';
@@ -345,6 +326,11 @@ static int ksr_tls_fill_missing(tls_domain_t *d, tls_domain_t *parent)
 	if(d->verify_client == -1)
 		d->verify_client = parent->verify_client;
 	LOG(L_INFO, "%s: verify_client=%d\n", tls_domain_str(d), d->verify_client);
+
+	if(d->verify_server_name == -1)
+		d->verify_server_name = parent->verify_server_name;
+	LOG(L_INFO, "%s: verify_server_name=%d\n", tls_domain_str(d),
+			d->verify_server_name);
 
 	return 0;
 }
@@ -480,7 +466,8 @@ int fix_shm_pathname(str *path)
 	str new_path;
 	char *abs_path;
 
-	if(path->s && path->len && *path->s != '.' && *path->s != '/') {
+	if(path->s && path->len && *path->s != '.' && *path->s != '/'
+			&& strncmp(path->s, "pkcs11:", 7)) {
 		abs_path = get_abs_pathname(0, path);
 		if(abs_path == 0) {
 			LM_ERR("get abs pathname failed\n");
@@ -592,18 +579,21 @@ static int load_crl(tls_domain_t *d)
 	LOG(L_INFO, "%s: Certificate revocation lists will be checked (%.*s)\n",
 			tls_domain_str(d), d->crl_file.len, d->crl_file.s);
 
-	do {
-		if(wolfSSL_CTX_load_verify_locations(d->ctx[0], d->crl_file.s, 0)
-				!= 1) {
-			ERR("%s: Unable to load certificate revocation list '%s'\n",
-					tls_domain_str(d), d->crl_file.s);
-			TLS_ERR("load_crl:");
-			return -1;
-		}
-		store = wolfSSL_CTX_get_cert_store(d->ctx[0]);
-		wolfSSL_X509_STORE_set_flags(
-				store, WOLFSSL_CRL_CHECK | WOLFSSL_CRL_CHECKALL);
-	} while(0);
+
+	if(wolfSSL_CTX_EnableCRL(d->ctx[0], 0) != WOLFSSL_SUCCESS) {
+		ERR("%s: Unable to enable CRL checking '%s'\n", tls_domain_str(d),
+				d->crl_file.s);
+		TLS_ERR("load_crl:");
+		return -1;
+	}
+	if(wolfSSL_CTX_LoadCRL(d->ctx[0], d->crl_file.s, WOLFSSL_FILETYPE_PEM, 0)
+			!= WOLFSSL_SUCCESS) {
+		ERR("%s: Unable to load CRL file '%s'\n", tls_domain_str(d),
+				d->crl_file.s);
+		TLS_ERR("load_crl:");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -623,18 +613,16 @@ static int set_cipher_list(tls_domain_t *d)
 {
 	char *cipher_list;
 
+	setup_dh(d->ctx[0]);
 	cipher_list = d->cipher_list.s;
 	if(!cipher_list)
 		return 0;
 
-	do {
-		if(wolfSSL_CTX_set_cipher_list(d->ctx[0], cipher_list) == 0) {
-			ERR("%s: Failure to set SSL context cipher list \"%s\"\n",
-					tls_domain_str(d), cipher_list);
-			return -1;
-		}
-		setup_dh(d->ctx[0]);
-	} while(0);
+	if(wolfSSL_CTX_set_cipher_list(d->ctx[0], cipher_list) == 0) {
+		ERR("%s: Failure to set SSL context cipher list \"%s\"\n",
+				tls_domain_str(d), cipher_list);
+		return -1;
+	}
 	return 0;
 }
 
@@ -871,6 +859,7 @@ static int tls_server_name_cb(SSL *ssl, int *ad, void *private)
 			ZSW(new_domain->server_name.s), new_domain->ctx[0], new_domain,
 			(new_domain->type & TLS_DOMAIN_DEF) ? " (default)" : "");
 	wolfSSL_set_SSL_CTX(ssl, new_domain->ctx[0]);
+	tls_pkcs11_open_token(ssl);
 	/* SSL_set_SSL_CTX only sets the correct certificate parameters, but does
 	   set the proper verify options. Thus this will be done manually! */
 
@@ -903,6 +892,18 @@ static int ksr_tls_fix_domain(tls_domain_t *d, tls_domain_t *def)
 {
 	if(ksr_tls_fill_missing(d, def) < 0)
 		return -1;
+
+	if(d->verify_server_name > 0) {
+		if(d->type & TLS_DOMAIN_SRV) {
+			LM_WARN("%s: verify_server_name is only used by client profiles"
+					" - ignored\n",
+					tls_domain_str(d));
+		} else if(d->verify_cert <= 0) {
+			LM_WARN("%s: verify_server_name is used only with"
+					" verify_certificate enabled - ignored\n",
+					tls_domain_str(d));
+		}
+	}
 
 	if(d->type & TLS_DOMAIN_ANY) {
 		if(d->server_name.s == NULL || d->server_name.len < 0) {
@@ -1008,16 +1009,23 @@ static int load_private_key(tls_domain_t *d)
 		for(idx = 0, ret_pwd = 0; idx < 3; idx++) {
 
 			/* defer pkcs11 keys to workers */
-			if(strncmp(d->pkey_file.s, "/uri:", 5) != 0) {
+			if(strncmp(d->pkey_file.s, "pkcs11:", 7) != 0) {
 				ret_pwd = wolfSSL_CTX_use_PrivateKey_file(
 						d->ctx[0], d->pkey_file.s, SSL_FILETYPE_PEM);
 			} else {
-				if(ksr_tcp_main_threads == 0) {
-					LM_ERR("%s: wolfSSL HSM[key = %s] support requires "
-						   "MT-mode: tcp_main_thread=1\n",
-							tls_domain_str(d), d->pkey_file.s);
+				pkcs11_context_t *ctxd;
+				ctxd = pkg_malloc(sizeof(pkcs11_context_t));
+				memset(ctxd, 0, sizeof(pkcs11_context_t));
+				if(ctxd == NULL) {
+					ERR("%s: Cannot allocate memory for PKCS#11 context\n",
+							tls_domain_str(d));
 					return -1;
 				}
+				ctxd->token_id = -1;
+				strncpy(ctxd->config_key, d->pkey_file.s,
+						sizeof(ctxd->config_key) - 1);
+				ctxd->config_key[sizeof(ctxd->config_key) - 1] = 0;
+				wolfSSL_CTX_set_ex_data(d->ctx[0], 0, ctxd);
 				ret_pwd = 1;
 			}
 			if(ret_pwd) {
@@ -1036,7 +1044,7 @@ static int load_private_key(tls_domain_t *d)
 			TLS_ERR("load_private_key:");
 			return -1;
 		}
-		if(strncmp(d->pkey_file.s, "/uri:", 5) == 0) {
+		if(strncmp(d->pkey_file.s, "pkcs11:", 7) == 0) {
 			// skip private key validity check for HSM keys
 			continue;
 		}
@@ -1151,6 +1159,9 @@ int tls_fix_domains_cfg(tls_domains_cfg_t *cfg, tls_domain_t *srv_defaults,
 		return -1;
 	}
 
+	if(ssl_max_send_fragment >= 0)
+		LM_WARN("ssl_max_send_fragment is not supported by tls_wolfssl"
+				" - ignored\n");
 	/* only in >= 0.9.9 */
 	if(tls_foreach_CTX_in_cfg(
 			   cfg, tls_ssl_ctx_set_max_send_fragment, ssl_max_send_fragment, 0)
@@ -1165,21 +1176,12 @@ int tls_fix_domains_cfg(tls_domains_cfg_t *cfg, tls_domain_t *srv_defaults,
 		ERR("invalid ssl_read_ahead value (%d)\n", ssl_read_ahead);
 		return -1;
 	}
-	/* set options for SSL_write:
-		WOLFSSL_MODE_ACCEPT_MOVING_WRITE_BUFFER - needed when queueing
-		  clear text for a future write (WANTS_READ). In this case the
-		  buffer address will change for the repeated SSL_write() and
-		  without this option it will trigger the openssl sanity checks.
-		SSL_MODE_ENABLE_PARTIAL_WRITE - needed to deal with potentially
-		  huge multi-record writes that don't fit in the default buffer
-		  (the default buffer must have space for at least 1 record) */
-	if(tls_foreach_CTX_in_cfg(cfg, tls_ssl_ctx_mode,
-			   WOLFSSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
-					   | SSL_MODE_ENABLE_PARTIAL_WRITE,
-			   0)
+	/* wolfSSL_CTX_set_mode() takes one mode per call, not a mask; moving
+	 * write buffer is the wolfSSL default - enable multi-record partial write */
+	if(tls_foreach_CTX_in_cfg(
+			   cfg, tls_ssl_ctx_mode, SSL_MODE_ENABLE_PARTIAL_WRITE, 0)
 			< 0) {
-		ERR("could not set WOLFSSL_MODE_ACCEPT_MOVING_WRITE_BUFFER and"
-			" SSL_MODE_ENABLE_PARTIAL_WRITE\n");
+		ERR("could not set SSL_MODE_ENABLE_PARTIAL_WRITE\n");
 		return -1;
 	}
 
@@ -1394,13 +1396,12 @@ int tls_add_domain(tls_domains_cfg_t *cfg, tls_domain_t *d)
 static int load_pkcs11_private_key(tls_domain_t *d)
 {
 	int ret_pwd;
-	WOLFSSL *ssl;
 
 	if(!d->pkey_file.s || !d->pkey_file.len) {
 		DBG("%s: No private key specified\n", tls_domain_str(d));
 		return 0;
 	}
-	if(strncmp(d->pkey_file.s, "/uri:", 5) != 0)
+	if(strncmp(d->pkey_file.s, "pkcs11:", 7) != 0)
 		return 0;
 
 	char temp_name[512];
@@ -1410,12 +1411,12 @@ static int load_pkcs11_private_key(tls_domain_t *d)
 		return -1;
 	}
 
-	memcpy(temp_name, d->pkey_file.s + 5, d->pkey_file.len - 5);
-	temp_name[d->pkey_file.len - 5] = '\0';
+	memcpy(temp_name, d->pkey_file.s, d->pkey_file.len);
+	temp_name[d->pkey_file.len] = '\0';
 
 	LM_WARN("%s: Loading PKCS#11 key label '%s' for domain %p\n",
 			tls_domain_str(d), temp_name, d);
-	ret_pwd = tls_pkcs11_set_key(d->ctx[0], temp_name);
+	ret_pwd = tls_pkcs11_set_key(d->ctx[0], temp_name, 1);
 
 	if(ret_pwd) {
 		ERR("%s: Unable to load engine key label '%s'\n", tls_domain_str(d),

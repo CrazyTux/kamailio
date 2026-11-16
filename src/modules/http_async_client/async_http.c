@@ -58,6 +58,7 @@ extern struct tm_binds tmb;
 
 struct sip_msg *ah_reply = NULL;
 str ah_error = {NULL, 0};
+str ah_xdata = {NULL, 0};
 http_m_time_t ah_time = {0};
 
 async_http_worker_t *workers = NULL;
@@ -71,11 +72,16 @@ int async_http_init_worker(int prank, async_http_worker_t *worker)
 {
 	LM_DBG("initializing worker process: %d\n", prank);
 	worker->evbase = event_base_new();
+	if(worker->evbase == NULL) {
+		LM_ERR("failed to create event base\n");
+		return -1;
+	}
 	LM_DBG("base event %p created\n", worker->evbase);
 
 	worker->g = shm_malloc(sizeof(struct http_m_global));
 	if(worker->g == NULL) {
 		LM_ERR("out of shared memory\n");
+		event_base_free(worker->evbase);
 		return -1;
 	}
 	memset(worker->g, 0, sizeof(http_m_global_t));
@@ -149,6 +155,8 @@ void async_http_cb(struct http_m_reply *reply, void *param)
 	/* clean process-local result variables */
 	ah_error.s = NULL;
 	ah_error.len = 0;
+	ah_xdata.s = NULL;
+	ah_xdata.len = 0;
 
 	memset(&ah_time, 0, sizeof(struct http_m_time));
 	memset(ah_reply, 0, sizeof(struct sip_msg));
@@ -228,6 +236,7 @@ void async_http_cb(struct http_m_reply *reply, void *param)
 	strncpy(q_id, aq->id, strlen(aq->id));
 
 	q_id[strlen(aq->id)] = '\0';
+	ah_xdata = aq->xdata;
 
 	cfg_update();
 
@@ -238,6 +247,7 @@ void async_http_cb(struct http_m_reply *reply, void *param)
 		if(tmb.t_lookup_ident(&t, tindex, tlabel) < 0) {
 			LM_ERR("transaction not found %d:%d\n", tindex, tlabel);
 			LM_DBG("freeing query %p\n", aq);
+			free_sip_msg(ah_reply);
 			free_async_query(aq);
 			return;
 		}
@@ -276,6 +286,8 @@ void async_http_cb(struct http_m_reply *reply, void *param)
 	}
 
 done:
+	ah_xdata.s = NULL;
+	ah_xdata.len = 0;
 	free_sip_msg(ah_reply);
 	free_async_query(aq);
 
@@ -291,6 +303,7 @@ void notification_socket_cb(int fd, short event, void *arg)
 	int received;
 	int i, len;
 	async_query_t *aq;
+	int dispatched = 0;
 
 	http_m_params_t query_params;
 
@@ -319,6 +332,8 @@ void notification_socket_cb(int fd, short event, void *arg)
 	query_params.tcp_keepalive = aq->query_params.tcp_keepalive;
 	query_params.tcp_ka_idle = aq->query_params.tcp_ka_idle;
 	query_params.tcp_ka_interval = aq->query_params.tcp_ka_interval;
+	query_params.http_version = aq->query_params.http_version;
+	query_params.max_reply_size = aq->query_params.max_reply_size;
 
 	for(i = 0; i < aq->query_params.headers.len; i++) {
 		query_params.headers = curl_slist_append(
@@ -404,36 +419,42 @@ void notification_socket_cb(int fd, short event, void *arg)
 
 	if(new_request(&query, &query_params, async_http_cb, aq) < 0) {
 		LM_ERR("Cannot create request for %.*s\n", query.len, query.s);
-		free_async_query(aq);
+	} else {
+		dispatched = 1;
 	}
 
 done:
-	if(query_params.tls_client_cert) {
-		shm_free(query_params.tls_client_cert);
-		query_params.tls_client_cert = NULL;
-	}
-	if(query_params.tls_client_key) {
-		shm_free(query_params.tls_client_key);
-		query_params.tls_client_key = NULL;
-	}
-	if(query_params.tls_ca_path) {
-		shm_free(query_params.tls_ca_path);
-		query_params.tls_ca_path = NULL;
-	}
-	if(query_params.body.s && query_params.body.len > 0) {
-		shm_free(query_params.body.s);
-		query_params.body.s = NULL;
-		query_params.body.len = 0;
-	}
-
-	if(query_params.username) {
-		shm_free(query_params.username);
-		query_params.username = NULL;
-	}
-
-	if(query_params.password) {
-		shm_free(query_params.password);
-		query_params.password = NULL;
+	if(!dispatched) {
+		free_async_query(aq);
+		if(query_params.headers) {
+			curl_slist_free_all(query_params.headers);
+			query_params.headers = NULL;
+		}
+		if(query_params.tls_client_cert) {
+			shm_free(query_params.tls_client_cert);
+			query_params.tls_client_cert = NULL;
+		}
+		if(query_params.tls_client_key) {
+			shm_free(query_params.tls_client_key);
+			query_params.tls_client_key = NULL;
+		}
+		if(query_params.tls_ca_path) {
+			shm_free(query_params.tls_ca_path);
+			query_params.tls_ca_path = NULL;
+		}
+		if(query_params.body.s && query_params.body.len > 0) {
+			shm_free(query_params.body.s);
+			query_params.body.s = NULL;
+			query_params.body.len = 0;
+		}
+		if(query_params.username) {
+			shm_free(query_params.username);
+			query_params.username = NULL;
+		}
+		if(query_params.password) {
+			shm_free(query_params.password);
+			query_params.password = NULL;
+		}
 	}
 
 	return;
@@ -448,7 +469,14 @@ int init_socket(async_http_worker_t *worker)
 	return (0);
 }
 
-int async_send_query(sip_msg_t *msg, str *query, str *cbname)
+int async_send_query(
+		sip_msg_t *msg, str *query, str *cbname, ah_suspend_mode_t smode)
+{
+	return async_send_query_xdata(msg, query, cbname, smode, NULL);
+}
+
+int async_send_query_xdata(sip_msg_t *msg, str *query, str *cbname,
+		ah_suspend_mode_t smode, str *xdata)
 {
 	async_query_t *aq;
 	unsigned int tindex = 0;
@@ -472,7 +500,9 @@ int async_send_query(sip_msg_t *msg, str *query, str *cbname)
 	if(t == NULL || t == T_UNDEFINED) {
 		LM_DBG("no pre-existing transaction, switching to transaction-less "
 			   "behavior\n");
-	} else if(!ah_params.suspend_transaction) {
+	} else if(smode == AH_SUSPEND_NONE) {
+		LM_DBG("transaction won't be suspended (forced no-suspend mode)\n");
+	} else if(smode == AH_SUSPEND_CFG && !ah_params.suspend_transaction) {
 		LM_DBG("transaction won't be suspended\n");
 	} else {
 		if(tmb.t_suspend == NULL) {
@@ -501,6 +531,12 @@ int async_send_query(sip_msg_t *msg, str *query, str *cbname)
 	if(shm_str_dup(&aq->query, query) < 0) {
 		goto error;
 	}
+	if(xdata != NULL && xdata->s != NULL && xdata->len > 0) {
+		if(shm_str_dup(&aq->xdata, xdata) < 0) {
+			LM_ERR("Error allocating aq->xdata\n");
+			goto error;
+		}
+	}
 
 	memcpy(aq->cbname, cbname->s, cbname->len);
 	aq->cbname[cbname->len] = '\0';
@@ -516,9 +552,13 @@ int async_send_query(sip_msg_t *msg, str *query, str *cbname)
 	aq->query_params.tcp_keepalive = ah_params.tcp_keepalive;
 	aq->query_params.tcp_ka_idle = ah_params.tcp_ka_idle;
 	aq->query_params.tcp_ka_interval = ah_params.tcp_ka_interval;
+	aq->query_params.http_version = ah_params.http_version;
 	aq->query_params.headers = ah_params.headers;
+	ah_params.headers.t = NULL;
+	ah_params.headers.len = 0;
 	aq->query_params.method = ah_params.method;
 	aq->query_params.authmethod = ah_params.authmethod;
+	aq->query_params.max_reply_size = ah_params.max_reply_size;
 
 	q_idx++;
 	snprintf(q_id, MAX_ID_LEN + 1, "%u-%u", (unsigned int)getpid(), q_idx);
@@ -659,6 +699,14 @@ void init_query_params(struct query_params *p)
 void set_query_params(struct query_params *p)
 {
 	int len;
+	int i;
+	if(p->headers.t) {
+		for(i = 0; i < p->headers.len; i++) {
+			if(p->headers.t[i])
+				shm_free(p->headers.t[i]);
+		}
+		shm_free(p->headers.t);
+	}
 	p->headers.len = 0;
 	p->headers.t = NULL;
 	p->tls_verify_host = tls_verify_host;
@@ -671,6 +719,8 @@ void set_query_params(struct query_params *p)
 	p->tcp_keepalive = tcp_keepalive;
 	p->tcp_ka_idle = tcp_ka_idle;
 	p->tcp_ka_interval = tcp_ka_interval;
+	p->http_version = 0;
+	p->max_reply_size = default_max_reply_size;
 
 	if(p->tls_client_cert) {
 		shm_free(p->tls_client_cert);
@@ -744,20 +794,20 @@ int header_list_add(struct header_list *hl, str *hdr)
 {
 	char *tmp;
 
-	hl->len++;
-	hl->t = shm_reallocxf(hl->t, hl->len * sizeof(char *));
+	hl->t = shm_reallocxf(hl->t, (hl->len + 1) * sizeof(char *));
 	if(!hl->t) {
 		LM_ERR("shm memory allocation failure\n");
 		return -1;
 	}
-	hl->t[hl->len - 1] = shm_malloc(hdr->len + 1);
-	tmp = hl->t[hl->len - 1];
+	hl->t[hl->len] = shm_malloc(hdr->len + 1);
+	tmp = hl->t[hl->len];
 	if(!tmp) {
 		LM_ERR("shm memory allocation failure\n");
 		return -1;
 	}
 	memcpy(tmp, hdr->s, hdr->len);
 	*(tmp + hdr->len) = '\0';
+	hl->len++;
 
 	LM_DBG("stored new http header: [%s]\n", tmp);
 	return 1;
@@ -773,6 +823,8 @@ int query_params_set_method(struct query_params *qp, str *meth)
 		qp->method = AH_METH_PUT;
 	} else if(strncasecmp(meth->s, "DELETE", meth->len) == 0) {
 		qp->method = AH_METH_DELETE;
+	} else if(strncasecmp(meth->s, "PATCH", meth->len) == 0) {
+		qp->method = AH_METH_PATCH;
 	} else {
 		LM_ERR("Unsupported method: %.*s\n", meth->len, meth->s);
 		return -1;

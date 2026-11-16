@@ -40,11 +40,13 @@
 
 #include "../../core/dprint.h"
 #include "../../core/ip_addr.h"
+#include "../../core/resolve.h"
 #include "../../core/mem/shm_mem.h"
 #include "../../core/pt.h"
 #include "../../core/timer.h"
 #include "../../core/globals.h"
 #include "../../core/tcp_int_send.h"
+#include "../../core/tcp_reactor.h" /* tcp_reactor_connect_info() - mode 2 */
 #include "../../core/tcp_read.h"
 #include "../../core/tcp_mtops.h"
 #include "../../core/cfg/cfg.h"
@@ -64,8 +66,6 @@
 #include "wolfssl_pkcs11.h"
 
 #include "tls_cfg.h"
-
-int tls_run_event_routes(struct tcp_connection *c);
 
 #define TLS_RD_MBUF_SZ 65536
 #define TLS_WR_MBUF_SZ 65536
@@ -132,6 +132,7 @@ int tls_run_event_routes(struct tcp_connection *c);
 extern str sr_tls_xavp_cfg;
 
 static str _ksr_tls_connect_server_id = STR_NULL;
+int tls_pkcs11_open_token(WOLFSSL *);
 
 static void tls_init_ssl_cache(struct tls_extra_data *tls_c)
 {
@@ -178,7 +179,11 @@ static void tls_build_ssl_cache(
 	sni = wolfSSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 	if(sni != NULL) {
 		tls_c->ssl_servername = shm_malloc(strlen(sni) + 1);
-		strcpy(tls_c->ssl_servername, sni);
+		if(tls_c->ssl_servername == NULL) {
+			SHM_MEM_ERROR;
+		} else {
+			strcpy(tls_c->ssl_servername, sni);
+		}
 	}
 
 	strcpy(tls_c->ssl_cipher_desc, "unknown");
@@ -189,7 +194,11 @@ static void tls_build_ssl_cache(
 		cipher_name = wolfSSL_CIPHER_get_name(cipher);
 		if(cipher_name) {
 			tls_c->ssl_cipher_name = shm_malloc(strlen(cipher_name) + 1);
-			strcpy(tls_c->ssl_cipher_name, cipher_name);
+			if(tls_c->ssl_cipher_name == NULL) {
+				SHM_MEM_ERROR;
+			} else {
+				strcpy(tls_c->ssl_cipher_name, cipher_name);
+			}
 		}
 		tls_c->ssl_cipher_bits = wolfSSL_CIPHER_get_bits(cipher, &alg_bits);
 	}
@@ -220,6 +229,56 @@ static void tls_free_ssl_cache(struct tls_extra_data *data)
 		shm_free(data->ssl_peer_cert);
 	if(data->ssl_cert_chain)
 		shm_free(data->ssl_cert_chain);
+}
+
+/* copy the outbound tls xavp of the calling process (server_name,
+ * server_id) into ci as shm strings; without a server_id in the xavp, the
+ * one set by tls_set_connect_server_id() in this process
+ * - also the mode 2 tls_hook.connect_info: tcp main moves them from the
+ *   connect request to the new connection
+ * keep in sync with tls/tls_server.c */
+void tls_h_connect_info_f(ksr_coninfo_t *ci)
+{
+	sr_xavp_t *vavp = NULL;
+	str sname = str_init("server_name");
+	str sid = str_init("server_id");
+
+	/* the value set by tls_set_connect_server_id() for the next connect,
+	 * overwritten below by the xavp server_id, then reset */
+	if(_ksr_tls_connect_server_id.len > 0) {
+		if(shm_str_update(&ci->server_id, &_ksr_tls_connect_server_id) < 0) {
+			LM_WARN("failed to store outbound tls server_id in shm\n");
+		} else {
+			ksr_tls_set_connect_server_id(NULL);
+		}
+	}
+
+	if(sr_tls_xavp_cfg.s == NULL) {
+		return;
+	}
+
+	vavp = xavp_get_child_with_sval(&sr_tls_xavp_cfg, &sname);
+	if(vavp != NULL && vavp->val.v.s.len > 0) {
+		if(shm_str_update(&ci->server_name, &vavp->val.v.s) < 0) {
+			LM_WARN("failed to store outbound tls server_name in shm\n");
+		}
+	}
+
+	vavp = xavp_get_child_with_sval(&sr_tls_xavp_cfg, &sid);
+	if(vavp != NULL && vavp->val.v.s.len > 0) {
+		if(shm_str_update(&ci->server_id, &vavp->val.v.s) < 0) {
+			LM_WARN("failed to store outbound tls server_id in shm\n");
+		}
+	}
+}
+
+/* keep the xavp on the connection: tls_complete_init() runs in tcp main */
+static void tls_store_outbound_xavp(struct tcp_connection *c)
+{
+	if(c == NULL || (c->flags & F_CONN_PASSIVE)) {
+		return;
+	}
+	tls_h_connect_info_f(&c->cinfo);
 }
 
 int ksr_tls_set_connect_server_id(str *srvid)
@@ -256,10 +315,16 @@ int ksr_tls_set_connect_server_id(str *srvid)
 	return 0;
 }
 
-static str *tls_get_connect_server_id(void)
+static str *tls_get_connect_server_id(ksr_coninfo_t *ci)
 {
 	sr_xavp_t *vavp = NULL;
 	str sid = {"server_id", 9};
+
+	if(ci != NULL && ci->server_id.s != NULL && ci->server_id.len > 0) {
+		LM_DBG("found outbound server id in tcp connection: %.*s\n",
+				ci->server_id.len, ci->server_id.s);
+		return &ci->server_id;
+	}
 
 	if(sr_tls_xavp_cfg.s != NULL) {
 		vavp = xavp_get_child_with_sval(&sr_tls_xavp_cfg, &sid);
@@ -282,11 +347,17 @@ static str *tls_get_connect_server_id(void)
 /**
  * get the server name (sni) for outbound connections from xavp
  */
-static str *tls_get_connect_server_name(void)
+static str *tls_get_connect_server_name(ksr_coninfo_t *ci)
 {
 #ifndef OPENSSL_NO_TLSEXT
 	sr_xavp_t *vavp = NULL;
 	str sname = {"server_name", 11};
+
+	if(ci != NULL && ci->server_name.s != NULL && ci->server_name.len > 0) {
+		LM_DBG("found outbound server name in tcp connection: %.*s\n",
+				ci->server_name.len, ci->server_name.s);
+		return &ci->server_name;
+	}
 
 	if(sr_tls_xavp_cfg.s != NULL)
 		vavp = xavp_get_child_with_sval(&sr_tls_xavp_cfg, &sname);
@@ -300,6 +371,61 @@ static str *tls_get_connect_server_name(void)
 	return NULL;
 #endif
 }
+
+/**
+ * set the name the server certificate must match (RFC 6125) for an outbound
+ * connection: the server name of the connection (xavp, also sent as SNI),
+ * else the server_name of the client profile; an IP address is matched
+ * against the IP address entries of the certificate
+ * keep in sync with tls/tls_server.c
+ * @return 0 on success, -1 on error (no name available or set failure)
+ */
+static int tls_set_verify_server_name(
+		WOLFSSL *ssl, tls_domain_t *dom, str *sname)
+{
+	char name[256];
+	str *vname;
+	ip_addr_t ip;
+	int len;
+
+	vname = (sname != NULL && sname->len > 0) ? sname : &dom->server_name;
+	if(vname->s == NULL || vname->len <= 0) {
+		LM_ERR("%s: verify_server_name is set but no server name is"
+			   " available (xavp or server_name)\n",
+				tls_domain_str(dom));
+		return -1;
+	}
+	if((size_t)vname->len >= sizeof(name)) {
+		LM_ERR("%s: server name too long (%d)\n", tls_domain_str(dom),
+				vname->len);
+		return -1;
+	}
+	if(str2ipxbuf(vname, &ip) == 0) {
+		/* IP address: check the IP address entries, without brackets */
+		len = ip_addr2sbuf(&ip, name, sizeof(name) - 1);
+		name[len] = '\0';
+		if(wolfSSL_X509_VERIFY_PARAM_set1_ip_asc(wolfSSL_get0_param(ssl), name)
+				!= WOLFSSL_SUCCESS) {
+			LM_ERR("%s: failed to set the server address to verify: %s\n",
+					tls_domain_str(dom), name);
+			return -1;
+		}
+		LM_DBG("outbound TLS server address to verify: %s\n", name);
+		return 0;
+	}
+	memcpy(name, vname->s, vname->len);
+	name[vname->len] = '\0';
+	wolfSSL_X509_VERIFY_PARAM_set_hostflags(
+			wolfSSL_get0_param(ssl), WOLFSSL_NO_PARTIAL_WILDCARDS);
+	if(wolfSSL_set1_host(ssl, name) != WOLFSSL_SUCCESS) {
+		LM_ERR("%s: failed to set the server name to verify: %s\n",
+				tls_domain_str(dom), name);
+		return -1;
+	}
+	LM_DBG("outbound TLS server name to verify: %s\n", name);
+	return 0;
+}
+
 
 /** finish the ssl init.
  * Creates the SSL context + internal tls_extra_data and sets
@@ -345,8 +471,8 @@ static int tls_complete_init(struct tcp_connection *c)
 				cfg, TLS_DOMAIN_SRV, &c->rcv.dst_ip, c->rcv.dst_port, 0, 0);
 	} else {
 		state = S_TLS_CONNECTING;
-		sname = tls_get_connect_server_name();
-		srvid = tls_get_connect_server_id();
+		sname = tls_get_connect_server_name(&c->cinfo);
+		srvid = tls_get_connect_server_id(&c->cinfo);
 		dom = tls_lookup_cfg(cfg, TLS_DOMAIN_CLI, &c->rcv.dst_ip,
 				c->rcv.dst_port, sname, srvid);
 		ksr_tls_set_connect_server_id(NULL);
@@ -369,6 +495,9 @@ static int tls_complete_init(struct tcp_connection *c)
 	}
 	memset(data, '\0', sizeof(struct tls_extra_data));
 	data->ssl = wolfSSL_new(dom->ctx[0]);
+
+	/* Load PKCS#11 keys */
+	tls_pkcs11_open_token(data->ssl);
 	wolfSSL_BIO_new_bio_pair(
 			&internal_bio, TLS_WR_MBUF_SZ, &rw_bio, TLS_RD_MBUF_SZ);
 	data->rwbio = rw_bio;
@@ -401,6 +530,16 @@ static int tls_complete_init(struct tcp_connection *c)
 		LM_DBG("outbound TLS server name set to: %s\n", sname->s);
 	}
 #endif
+
+	if(state == S_TLS_CONNECTING && dom->verify_cert > 0
+			&& dom->verify_server_name > 0) {
+		if(tls_set_verify_server_name(data->ssl, dom, sname) < 0) {
+			wolfSSL_free(data->ssl);
+			tls_free_ssl_cache(data);
+			wolfSSL_BIO_free(data->rwbio);
+			goto error;
+		}
+	}
 
 	wolfSSL_set_bio(data->ssl, internal_bio, internal_bio);
 	c->extra_data = data;
@@ -494,8 +633,6 @@ static void tls_dump_cert_info(char *s, WOLFSSL_X509 *cert)
  *           returned and error==SSL_ERROR_NONE).
  *
  */
-
-extern int tls_pkcs11_open_token(WOLFSSL *);
 int tls_accept(struct tcp_connection *c, int *error)
 {
 	int ret;
@@ -512,9 +649,6 @@ int tls_accept(struct tcp_connection *c, int *error)
 		BUG("Invalid connection state %d (bug in TLS code)\n", tls_c->state);
 		goto err;
 	}
-
-
-	tls_pkcs11_open_token(ssl);
 
 	ret = wolfSSL_accept(ssl);
 	tls_init_ssl_cache(tls_c);
@@ -542,7 +676,7 @@ int tls_accept(struct tcp_connection *c, int *error)
 			LOG(tls_log, "tls_accept: client did not present a certificate\n");
 		}
 	} else { /* ret == 0 or < 0 */
-		*error = wolfSSL_get_error(ssl, ret);
+		*error = tls_get_error(ssl, ret);
 	}
 	return ret;
 err:
@@ -582,9 +716,6 @@ int tls_connect(struct tcp_connection *c, int *error)
 		goto err;
 	}
 
-	/* load external keys if necessary for mTLS */
-	tls_pkcs11_open_token(ssl);
-
 	ret = wolfSSL_connect(ssl);
 	tls_init_ssl_cache(tls_c);
 	if(unlikely(ret == 1)) {
@@ -612,9 +743,8 @@ int tls_connect(struct tcp_connection *c, int *error)
 			LOG(tls_log, "tls_connect: server did not "
 						 "present a certificate\n");
 		}
-		tls_run_event_routes(c);
 	} else { /* 0 or < 0 */
-		*error = wolfSSL_get_error(ssl, ret);
+		*error = tls_get_error(ssl, ret);
 	}
 	return ret;
 err:
@@ -719,8 +849,8 @@ int tls_h_tcpconn_init_f(struct tcp_connection *c, int sock)
 	c->type = PROTO_TLS;
 	c->rcv.proto = PROTO_TLS;
 	c->timeout = get_ticks_raw() + cfg_get(tls, tls_cfg, con_lifetime);
-	c->lifetime = cfg_get(tls, tls_cfg, con_lifetime);
 	c->extra_data = 0;
+	tls_store_outbound_xavp(c);
 	return 0;
 }
 
@@ -748,6 +878,16 @@ void tls_h_tcpconn_clean_direct(struct tcp_connection *c)
 		shm_free(c->extra_data);
 		c->extra_data = 0;
 	}
+	if(c->cinfo.server_name.s) {
+		shm_free(c->cinfo.server_name.s);
+		c->cinfo.server_name.s = NULL;
+		c->cinfo.server_name.len = 0;
+	}
+	if(c->cinfo.server_id.s) {
+		shm_free(c->cinfo.server_id.s);
+		c->cinfo.server_id.s = NULL;
+		c->cinfo.server_id.len = 0;
+	}
 }
 
 
@@ -758,6 +898,7 @@ typedef struct tls_clean_params
 } tls_clean_params_t;
 
 
+/* keep in sync with tls/tls_server.c */
 static void tls_h_tcpconn_clean_mt_thread_cb(void *p, int pidx)
 {
 	tls_clean_params_t *cparams = NULL;
@@ -782,11 +923,11 @@ static void tls_h_tcpconn_clean_mt_thread_cb(void *p, int pidx)
 void tls_h_tcpconn_clean_f(struct tcp_connection *c)
 {
 	/* At shutdown in MT mode, PROC_TCP_MAIN is already dead and the OS
-         * reclaims all memory. Avoid touching its heap entirely. */
-	if(_ksr_is_main && ksr_tcp_main_threads != 0)
+	 * reclaims all memory. Avoid touching its heap entirely. */
+	if(_ksr_is_main)
 		return;
 
-	if(ksr_tcp_main_threads != 0 && !is_tcp_main() && !_ksr_is_main) {
+	if(!is_tcp_main() && !_ksr_is_main) {
 		int dsize = 0;
 		tcpx_task_t *ptask = NULL;
 		tcpx_task_result_t *rtask = NULL;
@@ -902,17 +1043,21 @@ static char *get_tls_domain_str(
 	tls_domains_cfg_t *cfg;
 	str *sname = NULL;
 	str *srvid = NULL;
+	ksr_coninfo_t *ci;
 
 	lock_get(tls_domains_cfg_lock);
 	cfg = *tls_domains_cfg;
 	atomic_inc(&cfg->ref_count);
 	lock_release(tls_domains_cfg_lock);
 
-	if(c->flags & F_CONN_PASSIVE) {
+	if(c && (c->flags & F_CONN_PASSIVE)) {
 		dom = tls_lookup_cfg(cfg, TLS_DOMAIN_SRV, ip, port, 0, 0);
 	} else {
-		sname = tls_get_connect_server_name();
-		srvid = tls_get_connect_server_id();
+		/* no connection: the xavps, or in mode 2 tcp main the worker's
+		 * attributes from the connect request being looked up */
+		ci = (c != NULL) ? &c->cinfo : tcp_reactor_connect_info();
+		sname = tls_get_connect_server_name(ci);
+		srvid = tls_get_connect_server_id(ci);
 		dom = tls_lookup_cfg(cfg, TLS_DOMAIN_CLI, ip, port, sname, srvid);
 	}
 
@@ -942,7 +1087,8 @@ int tls_h_match_domain_f(
 		return 0;
 	}
 
-	dom_str = get_tls_domain_str(c, ip, port);
+	dom_str = get_tls_domain_str(
+			NULL /* XAVPs, or the mode 2 connect request */, ip, port);
 	STR_SET(dom, dom_str);
 
 	return STR_EQ(tls_c->dom, dom);
@@ -1069,7 +1215,7 @@ redo_wr:
 		if(unlikely(n >= 1)) {
 			n = wolfSSL_write(ssl, buf + offs, len - offs);
 			if(unlikely(n <= 0))
-				ssl_error = wolfSSL_get_error(ssl, n);
+				ssl_error = tls_get_error(ssl, n);
 		} else {
 			/* tls_connect failed/needs more IO */
 			if(unlikely(n < 0 && ssl_error == WOLFSSL_ERROR_NONE))
@@ -1082,7 +1228,7 @@ redo_wr:
 		if(unlikely(n >= 1)) {
 			n = wolfSSL_write(ssl, buf + offs, len - offs);
 			if(unlikely(n <= 0))
-				ssl_error = wolfSSL_get_error(ssl, n);
+				ssl_error = tls_get_error(ssl, n);
 		} else {
 			/* tls_accept failed/needs more IO */
 			if(unlikely(n < 0 && ssl_error == WOLFSSL_ERROR_NONE))
@@ -1092,7 +1238,7 @@ redo_wr:
 	} else {
 		n = wolfSSL_write(ssl, buf + offs, len - offs);
 		if(unlikely(n <= 0))
-			ssl_error = wolfSSL_get_error(ssl, n);
+			ssl_error = tls_get_error(ssl, n);
 	}
 	TLS_WR_TRACE("(%p) wolfSSL_write(%p + %d, %d) => %d (err=%d)\n", c, buf,
 			offs, len - offs, n, ssl_error);
@@ -1127,15 +1273,14 @@ redo_wr:
 				send_flags->f &= ~SND_F_CON_CLOSE;
 				break; /* or goto end */
 			case WOLFSSL_ERROR_WANT_WRITE:
-				if(unlikely(offs == 0)) {
-					/*  error, no record fits in the buffer or
-				 * no partial write enabled and buffer to small to fit
-				 * all the records */
+				if(unlikely(wr_used == 0)) {
+					/* error, nothing encoded - no record fits in the buffer */
 					BUG("write buffer too small (%d/%d bytes)\n", (int)wr_used,
 							TLS_WR_MBUF_SZ);
 					goto bug;
 				} else {
-					/* offs != 0 => something was "written"  */
+					/* wr_buf full, maybe with offs == 0: flush it and retry
+					 * the rest - wolfSSL resumes its pending record */
 					*rest_buf = buf + offs;
 					*rest_len = len - offs;
 					/* this function should be called again => disallow
@@ -1231,7 +1376,9 @@ bug:
 	return -1;
 ssl_eof:
 	c->state = S_CONN_EOF;
-	c->flags |= F_CONN_FORCE_EOF;
+	/* mode 2: c->flags belongs to the io_wait thread; the write job's -1 closes c */
+	if(ksr_tcp_main_threads != 2)
+		c->flags |= F_CONN_FORCE_EOF;
 	/* use 2-pass read for wolfSSL ring buffer */
 	wr_used = wolfSSL_BIO_pending(rwbio);
 	for(nr = 0; nr < wr_used;) {
@@ -1253,16 +1400,6 @@ ssl_eof:
 }
 
 
-int tls_h_encode_mp_f(struct tcp_connection *c, const char **pbuf,
-		unsigned int *plen, const char **rest_buf, unsigned int *rest_len,
-		snd_flags_t *send_flags)
-{
-	static unsigned char wr_buf[TLS_WR_MBUF_SZ];
-
-	return tls_h_encode_helper_f(
-			c, pbuf, plen, rest_buf, rest_len, send_flags, wr_buf);
-}
-
 typedef struct tls_encode_params
 {
 	struct tcp_connection *c;
@@ -1274,6 +1411,7 @@ typedef struct tls_encode_params
 	int pidx;
 } tls_encode_params_t;
 
+/* keep in sync with tls/tls_server.c */
 static void tls_h_encode_mt_thread_cb(void *p, int pidx)
 {
 	tls_encode_params_t *eparams = NULL;
@@ -1308,6 +1446,7 @@ int tls_h_encode_mt_f(struct tcp_connection *c, const char **pbuf,
 	tcpx_task_result_t *rtask = NULL;
 	tls_encode_params_t *eparams = NULL;
 	char *ps = NULL;
+	const char *obuf = NULL;
 	int ret = 0;
 
 	LM_DBG("preparing task for tcp main process threads\n");
@@ -1326,6 +1465,7 @@ int tls_h_encode_mt_f(struct tcp_connection *c, const char **pbuf,
 	ps = (char *)eparams + sizeof(tls_encode_params_t);
 
 	eparams->c = c;
+	obuf = *pbuf; /* caller plaintext buffer - rest_buf is an offset into it */
 	eparams->pbuf = ps;
 	memcpy(eparams->pbuf, *pbuf, *plen);
 	eparams->plen = *plen;
@@ -1354,7 +1494,7 @@ int tls_h_encode_mt_f(struct tcp_connection *c, const char **pbuf,
 	*pbuf = eparams->pbuf;
 	*plen = eparams->plen;
 	if(eparams->rest_buf != NULL) {
-		*rest_buf = *pbuf + (eparams->rest_buf - ps);
+		*rest_buf = obuf + (eparams->rest_buf - ps);
 	}
 	*rest_len = eparams->rest_len;
 	if(send_flags != NULL) {
@@ -1369,17 +1509,13 @@ int tls_h_encode_mt_f(struct tcp_connection *c, const char **pbuf,
 
 /**
  * tls encode core callback
- * - for parameters see tls_h_encode_mp_f(...)
+ * - for parameters see tls_h_encode_helper_f(...)
  */
 int tls_h_encode_f(struct tcp_connection *c, const char **pbuf,
 		unsigned int *plen, const char **rest_buf, unsigned int *rest_len,
 		snd_flags_t *send_flags)
 {
-	if(ksr_tcp_main_threads == 0) {
-		return tls_h_encode_mp_f(c, pbuf, plen, rest_buf, rest_len, send_flags);
-	} else {
-		return tls_h_encode_mt_f(c, pbuf, plen, rest_buf, rest_len, send_flags);
-	}
+	return tls_h_encode_mt_f(c, pbuf, plen, rest_buf, rest_len, send_flags);
 }
 
 
@@ -1418,7 +1554,7 @@ int tls_h_read_mp_f(struct tcp_connection *c, rd_conn_flags_t *flags)
 	WOLFSSL_BIO *rwbio;
 	unsigned char rd_buf[TLS_RD_MBUF_SZ];
 	unsigned char wr_buf[TLS_WR_MBUF_SZ];
-	size_t wr_used, rd_unused;
+	size_t wr_used, rd_pending;
 	size_t nr, npos, nw;
 	struct tls_extra_data *tls_c;
 	int n, flush_flags;
@@ -1456,9 +1592,12 @@ redo_read:
 	/* real read() */
 	/* read() only if no previously detected EOF, or previous
      * short read (which means the socket buffer was emptied) */
-	if(likely(!(*flags & (RD_CONN_EOF | RD_CONN_SHORT_READ)))) {
-		/* don't read more than the free bytes in the tcp req buffer */
-		read_size = MIN_unsigned(TLS_RD_MBUF_SZ, bytes_free);
+	/* ciphertext left unread in the rd BIO when the tcp req buffer filled */
+	rd_pending = wolfSSL_BIO_ctrl_pending(wolfSSL_SSL_get_rbio(tls_c->ssl));
+	if(likely(!(*flags & (RD_CONN_EOF | RD_CONN_SHORT_READ))
+			   && rd_pending < TLS_RD_MBUF_SZ)) {
+		/* don't read more than the free bytes in the tcp req buffer or BIO */
+		read_size = MIN_unsigned(TLS_RD_MBUF_SZ - rd_pending, bytes_free);
 		bytes_read =
 				tcp_read_data(_tconfd(c), c, (char *)rd_buf, read_size, flags);
 		TLS_RD_TRACE("(%p, %p) tcp_read_data(..., %d, *%d) => %d bytes\n", c,
@@ -1607,7 +1746,7 @@ continue_ssl_read:
 			ssl_error = WOLFSSL_ERROR_ZERO_RETURN;
 		} else {
 			if(unlikely(n <= 0)) {
-				ssl_error = wolfSSL_get_error(ssl, n);
+				ssl_error = tls_get_error(ssl, n);
 				err_src = "TLS read:";
 				/*  errors handled below, outside the lock */
 			} else {
@@ -1665,14 +1804,7 @@ continue_ssl_read:
 		case WOLFSSL_ERROR_WANT_READ:
 			TLS_RD_TRACE("(%p, %p) SSL_ERROR_WANT_READ *flags=%d\n", c, flags,
 					*flags);
-			/* needs to read more data */
-			if(unlikely((rd_unused = wolfSSL_BIO_wpending(rwbio)))) {
-				/* data still in the read buffer */
-				BUG("SSL_ERROR_WANT_READ but data still in"
-					" the rbio (%d bytes)\n",
-						(int)rd_unused);
-				goto bug;
-			}
+			/* needs to read more data (a partial record may wait in the rbio) */
 			if(unlikely((*flags & (RD_CONN_EOF | RD_CONN_SHORT_READ)) == 0)
 					&& bytes_free) {
 				/* there might still be data to read and there is space
@@ -1815,6 +1947,7 @@ typedef struct tls_read_params
 } tls_read_params_t;
 
 
+/* keep in sync with tls/tls_server.c */
 static void tls_h_read_mt_thread_cb(void *p, int pidx)
 {
 	tls_read_params_t *eparams = NULL;
@@ -1890,72 +2023,11 @@ int tls_h_read_mt_f(struct tcp_connection *c, rd_conn_flags_t *flags)
 
 int tls_h_read_f(struct tcp_connection *c, rd_conn_flags_t *flags)
 {
-	if(ksr_tcp_main_threads == 0) {
-		return tls_h_read_mp_f(c, flags);
-	} else {
-		return tls_h_read_mt_f(c, flags);
-	}
+	return tls_h_read_mt_f(c, flags);
 }
 
-static int _tls_evrt_connection_out = -1; /* default disabled */
+/* The tls:connection-out event route was never functional in this module (it
+ * was gated behind a p_onsend check that is always NULL at handshake time) and
+ * has been removed. sr_tls_event_callback is retained only so the long-standing
+ * "event_callback" modparam still parses; it has no effect. */
 str sr_tls_event_callback = STR_NULL;
-
-/*!
- * lookup tls event routes
- */
-void tls_lookup_event_routes(void)
-{
-	_tls_evrt_connection_out = route_lookup(&event_rt, "tls:connection-out");
-	if(_tls_evrt_connection_out >= 0
-			&& event_rt.rlist[_tls_evrt_connection_out] == 0)
-		_tls_evrt_connection_out = -1; /* disable */
-	if(_tls_evrt_connection_out != -1)
-		forward_set_send_info(1);
-}
-
-/**
- *
- */
-int tls_run_event_routes(struct tcp_connection *c)
-{
-	int backup_rt;
-	struct run_act_ctx ctx;
-	sip_msg_t *fmsg = NULL;
-	str evname = str_init("tls:connection-out");
-	sr_kemi_eng_t *keng = NULL;
-
-	if(_tls_evrt_connection_out < 0 && sr_tls_event_callback.len <= 0)
-		return 0;
-
-	if(p_onsend == 0 || p_onsend->msg == 0)
-		return 0;
-
-	if(faked_msg_init() < 0)
-		return -1;
-	fmsg = faked_msg_next();
-
-	backup_rt = get_route_type();
-	set_route_type(LOCAL_ROUTE);
-	init_run_actions_ctx(&ctx);
-	tls_set_pv_con(c);
-	if(_tls_evrt_connection_out >= 0) {
-		run_top_route(event_rt.rlist[_tls_evrt_connection_out], fmsg, 0);
-	} else {
-		keng = sr_kemi_eng_get();
-		if(keng != NULL) {
-			if(sr_kemi_ctx_route(keng, &ctx, fmsg, EVENT_ROUTE,
-					   &sr_tls_event_callback, &evname)
-					< 0) {
-				LM_ERR("error running event route kemi callback\n");
-				return -1;
-			}
-		}
-	}
-	/* drop() executed in the event route - set nosend flag */
-	if(unlikely(ctx.run_flags & DROP_R_F)) {
-		c->flags |= F_CONN_NOSEND;
-	}
-	tls_set_pv_con(0);
-	set_route_type(backup_rt);
-	return 0;
-}

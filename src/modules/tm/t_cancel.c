@@ -103,6 +103,44 @@ void prepare_to_cancel(
 	}
 }
 
+/** Defer the CANCEL for INVITE branches without any reply.
+ * A CANCEL can be sent on a branch only after a provisional reply was
+ * received on it (RFC 3261, section 9.1). The branches prepared for
+ * canceling that have not received any reply yet are marked as canceled
+ * and their CANCEL is sent when the first provisional reply arrives (see
+ * reply_received()). They are removed from the cancel bitmap, so the
+ * subsequent cancel_uacs() does not process them again.
+ * Must be called with REPLY_LOCK held, after prepare_to_cancel(), when a
+ * 2xx reply completes the INVITE transaction. Setting the state before
+ * REPLY_LOCK is released ensures that a provisional reply processed by
+ * another process right after it finds the branch already canceled.
+ * @param t - transaction
+ * @param cancel_bm - branch bitmap filled by prepare_to_cancel(), updated
+ */
+void defer_cancel_unreplied(struct cell *t, branch_bm_t *cancel_bm)
+{
+	int i;
+	void *pcbuf;
+
+	if(!is_invite(t))
+		return;
+	for(i = 0; i < t->nr_of_outgoings; i++) {
+		if(!(*cancel_bm & (1 << i)) || t->uac[i].last_received >= 100
+				|| t->uac[i].request.buffer == NULL)
+			continue;
+		/* same state as left by cancel_branch() with F_CANCEL_B_KILL
+		 * for a branch without reply */
+		t->uac[i].request.flags |= F_RB_CANCELED;
+		stop_rb_timers(&t->uac[i].request);
+		/* remove BUSY_BUFFER set by prepare_to_cancel(), the CANCEL is
+		 * built on the first provisional reply */
+		pcbuf = &t->uac[i].local_cancel.buffer;
+		atomic_set_long(pcbuf, 0);
+		*cancel_bm &= ~(1 << i);
+		LM_DBG("CANCEL on branch %d deferred to first 1xx reply\n", i);
+	}
+}
+
 
 /* cancel branches scheduled for deletion
  * params: t          - transaction
@@ -216,7 +254,7 @@ int cancel_branch(struct cell *t, int branch, sip_msg_t *cancel_msg,
 	int ret;
 	struct cancel_info tmp_cd;
 	void *pcbuf;
-	int reply_status;
+	int reply_status = 0;
 	int rt, backup_rt;
 	struct run_act_ctx ctx;
 	sip_msg_t msg;
@@ -255,10 +293,13 @@ int cancel_branch(struct cell *t, int branch, sip_msg_t *cancel_msg,
 				reply_status =
 						relay_reply(t, FAKED_REPLY, branch, 487, &tmp_cd, 1);
 				if(reply_status == RPS_ERROR || reply_status == RPS_TGONE) {
+					LM_DBG("skip sending cancel - reply status: %d\n",
+							reply_status);
 					return -1;
 				}
 			}
 			/* do nothing, hope that the caller will clean up */
+			LM_DBG("skip sending cancel - flags: F_CANCEL_B_KILL\n");
 			return ret;
 		}
 	} else {
@@ -277,11 +318,19 @@ int cancel_branch(struct cell *t, int branch, sip_msg_t *cancel_msg,
 					reply_status = relay_reply(
 							t, FAKED_REPLY, branch, 487, &tmp_cd, 1);
 					if(reply_status == RPS_ERROR || reply_status == RPS_TGONE) {
+						LM_DBG("skip sending cancel - reply status: %d\n",
+								reply_status);
 						return -1;
 					}
+					LM_DBG("skip sending cancel - flags: "
+						   "F_CANCEL_B_FAKE_REPLY (reply status: %d)\n",
+							reply_status);
 					return 0; /* should be inactive after the 487 */
 				}
 				/* do nothing, just wait for the final timeout */
+				LM_DBG("skip sending cancel - wait for the final timeout"
+					   " (last received: %d reply status: %d)\n",
+						t->uac[branch].last_received, reply_status);
 				return 1;
 			}
 		}
@@ -433,8 +482,9 @@ void rpc_cancel(rpc_t *rpc, void *c)
 	prepare_to_cancel(trans, &cancel_data.cancel_bitmap, 0);
 	/* tell tm to cancel the call */
 	DBG("Now calling cancel_uacs\n");
-	i = cancel_uacs(trans, &cancel_data, F_CANCEL_LOCAL); /* don't fake 487s,
-										 just wait for timeout */
+	/* F_CANCEL_LOCAL: don't fake 487s, just wait for timeout */
+	i = cancel_uacs(trans, &cancel_data,
+			F_CANCEL_LOCAL | cfg_get(tm, tm_cfg, cancel_b_flags));
 
 	/* t_lookup_callid REF`d the transaction for us, we must UNREF here! */
 	UNREF(trans);

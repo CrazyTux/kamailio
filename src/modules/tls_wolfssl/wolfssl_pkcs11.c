@@ -21,17 +21,27 @@
 
 #include <wolfssl/wolfcrypt/wc_pkcs11.h>
 #include <wolfssl/wolfcrypt/cryptocb.h>
+#include <wolfssl/wolfcrypt/asn_public.h>
+#include <wolfssl/wolfcrypt/ecc.h>
+#include <wolfssl/wolfcrypt/random.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <pthread.h>
-#include <threads.h>
 
+#include "../../core/mem/shm_mem.h"
 #include "../../core/dprint.h"
+#include "wolfssl_pkcs11.h"
 
-#define PKCS11_MAX_DEVS 4
+#define PKCS11_MAX_DEVS 8
 
+
+/* Configuration for the PKCS#11 module.
+ *
+ * Pkcs11Dev can be shared by multiple threads
+ * The device objeect is stored as a member
+ */
 typedef struct
 {
 	int module_id;
@@ -41,6 +51,10 @@ typedef struct
 
 } pkcs11_module_t;
 
+/* Configuration DTO for for token
+ *  details
+ *
+ */
 typedef struct
 {
 	int token_id;
@@ -51,24 +65,26 @@ typedef struct
 	int used;
 } pkcs11_token_t;
 
-typedef struct
-{
-	int token_id;
-	char private_key[256];
-} pkcs11_context_t;
+/* Each hardware key 0-3 will be backed
+ * by a single Pkcs11Token with same devId.
+ *
+ * Access to the token will be serialized in the
+ * callback.
+ */
 
 typedef struct
 {
 	Pkcs11Token tok;
-	int used;
+	int used; // when non-zero will be devId + 1
+	pthread_mutex_t mutex;
 } pkcs11_device_t;
 
 static pkcs11_module_t _pkcs11_modules[PKCS11_MAX_DEVS];
 static pkcs11_token_t _pkcs11_tokens[PKCS11_MAX_DEVS];
 
-thread_local static pkcs11_device_t _pkcs11_devices[PKCS11_MAX_DEVS];
-extern thread_local int thread_etask_pidx;
-extern int ksr_tcp_main_threads;
+static pkcs11_device_t _pkcs11_devices[PKCS11_MAX_DEVS];
+extern _Thread_local int thread_etask_pidx;
+extern int wolfssl_child_rank;
 
 
 /*
@@ -130,17 +146,30 @@ static int pkcs11_resolve_pin(const char *raw, char *out, int out_sz)
  * Returns 1 if the field was found and copied into out, 0 otherwise.
  */
 static int pkcs11_parse_field(
-		const char *uri, const char *field, char *out, int out_sz)
+		const char *uri, const char *field, char *out, int out_sz, int query)
 {
 	const char *p;
 	const char *end;
 	int len;
+	const char *question_mark = strchr(uri, '?');
 
-	p = strstr(uri, field);
+	if(query) {
+		if(!question_mark)
+			return 0;
+		p = strstr(question_mark, field);
+	} else {
+		p = strstr(uri, field);
+		if(p && question_mark && p > question_mark)
+			return 0;
+	}
+
 	if(!p)
 		return 0;
+
 	p += strlen(field);
-	end = strchr(p, ';');
+
+	end = strpbrk(p, query ? "&" : ";?");
+
 	len = end ? (int)(end - p) : (int)strlen(p);
 	if(len <= 0 || len >= out_sz)
 		return 0;
@@ -187,19 +216,20 @@ void uri_decode(char *dst, const char *src)
 
 
 /*
- * Load a PKCS#11 private key identified by a URI into a WOLFSSL_CTX.
+ * Load a PKCS#11 private key identified by a PKCS#11 URI (RFC 7512) into a WOLFSSL_CTX.
  *
  * URI format:
- *   pkcs11:module=<path_to_pkcs11_lib.so>;token=<token_name>;object=<key_label>
- *               [;pin=<pin>|env:<VAR>|file:<path>]
+ *   pkcs11:token=<token_name>;object=<key_label>?
+ *               [module_path=<module>]
+ *               [&pin=<pin>|pin-value=env:<VAR>|pin-value=file:<path>]
  *
- * - module: absolute path to PKCS#11 shared library (mandatory)
+ * - module_path: absolute path to PKCS#11 shared library (mandatory)
  * - token:  PKCS#11 token name (mandatory)
  * - object: key label (mandatory) - used to look up the private key
  * - pin:    token PIN; optional if the token requires no login
- *           pin=secret          literal PIN
- *           pin=env:VAR_NAME    read from environment variable
- *           pin=file:/path      read first line from file
+ *           pin-value=secret          literal PIN
+ *           pin-source=env:VAR_NAME    read from environment variable
+ *           pin-source=file:/path      read first line from file
  *
  * Devices are cached by (module, token): the same pair reuses the
  * already-registered devId across multiple calls.
@@ -208,12 +238,113 @@ void uri_decode(char *dst, const char *src)
  */
 
 
+/* 1 for an rsa public-key operation (encrypt or verify) on a key holding
+ * n/e, e.g. the tls signature self-check: wolfSSL then runs it in software */
+static int pk_rsa_public_in_sw(const wc_CryptoInfo *info)
+{
+#ifndef NO_RSA
+	const RsaKey *key;
+
+	switch(info->pk.type) {
+		case WC_PK_TYPE_RSA:
+#ifdef WOLF_CRYPTO_CB_RSA_PAD
+		/* padded types: wolfSSL 5.7.4+, sent with WOLF_CRYPTO_CB_RSA_PAD */
+		case WC_PK_TYPE_RSA_PKCS:
+		case WC_PK_TYPE_RSA_PSS:
+		case WC_PK_TYPE_RSA_OAEP:
+#endif
+			break;
+		default:
+			return 0;
+	}
+	/* the type names the key and the raw rsa direction: public encrypt =
+	 * encrypt, public decrypt = verify; sign and decrypt stay on the token */
+	if(info->pk.rsa.type != RSA_PUBLIC_ENCRYPT
+			&& info->pk.rsa.type != RSA_PUBLIC_DECRYPT)
+		return 0;
+	key = info->pk.rsa.key;
+	return key != NULL && !mp_iszero(&key->n) && !mp_iszero(&key->e);
+#else
+	return 0;
+#endif
+}
+
+#ifdef HAVE_ECC
+/* ec key check for a token holding the private key alone (wolfSSL issue
+ * 10057): sign a random digest on the token, verify it in software with the
+ * certificate's public key. Returns 0 when the key matches the certificate */
+static int pk_ecc_check_by_sign(wc_CryptoInfo *info)
+{
+	ecc_key pub;
+	WC_RNG rng;
+	byte digest[WC_MAX_DIGEST_SIZE];
+	byte sig[ECC_MAX_SIG_SIZE];
+	word32 idx = 0;
+	word32 sig_len = sizeof(sig);
+	int dlen;
+	int res = 0;
+	int ret;
+
+	if(wc_ecc_init(&pub) != 0)
+		return -1;
+	ret = wc_EccPublicKeyDecode(
+			info->pk.ecc_check.pubKey, &idx, &pub, info->pk.ecc_check.pubKeySz);
+	if(ret != 0) {
+		wc_ecc_free(&pub);
+		return ret;
+	}
+	ret = wc_InitRng(&rng);
+	if(ret != 0) {
+		wc_ecc_free(&pub);
+		return ret;
+	}
+	/* digest of the curve size, within the sign limits */
+	dlen = wc_ecc_size(&pub);
+	if(dlen <= 0 || dlen > (int)sizeof(digest))
+		dlen = (int)sizeof(digest);
+	ret = wc_RNG_GenerateBlock(&rng, digest, (word32)dlen);
+	if(ret == 0)
+		ret = wc_ecc_sign_hash(digest, (word32)dlen, sig, &sig_len, &rng,
+				info->pk.ecc_check.key);
+	if(ret == 0)
+		ret = wc_ecc_verify_hash(
+				sig, sig_len, digest, (word32)dlen, &res, &pub);
+	if(ret == 0 && res != 1)
+		ret = -1;
+	wc_FreeRng(&rng);
+	wc_ecc_free(&pub);
+	return ret;
+}
+#endif
+
 static int my_FilterPk(int devId, wc_CryptoInfo *info, void *ctx)
 {
 	int ret = CRYPTOCB_UNAVAILABLE;
+	pkcs11_device_t *data = ctx;
 
-	if(info->algo_type == WC_ALGO_TYPE_PK)
-		ret = wc_Pkcs11_CryptoDevCb(devId, info, ctx);
+	if(info->algo_type == WC_ALGO_TYPE_PK) {
+		/* keep public ops off the token: strict HSMs refuse raw rsa
+		 * (CKM_RSA_X_509) and session key objects */
+		if(pk_rsa_public_in_sw(info))
+			return CRYPTOCB_UNAVAILABLE;
+		pthread_mutex_lock(&data->mutex);
+		ret = wc_Pkcs11_CryptoDevCb(devId, info, &data->tok);
+		pthread_mutex_unlock(&data->mutex);
+#ifdef HAVE_ECC
+		/* ec key check: the token lacks the public key object (MP_CMP_E is
+		 * a real mismatch); prove the key by sign + verify, outside the lock:
+		 * the sign comes back through this callback */
+		if(ret != 0 && ret != MP_CMP_E
+				&& info->pk.type == WC_PK_TYPE_EC_CHECK_PRIV_KEY
+				&& pk_ecc_check_by_sign(info) == 0) {
+			LM_INFO("ec key '%.*s': token holds the private key alone,"
+					" matched to the certificate by sign + verify\n",
+					info->pk.ecc_check.key->labelLen,
+					info->pk.ecc_check.key->label);
+			ret = 0;
+		}
+#endif
+	}
 	return ret;
 }
 
@@ -246,47 +377,23 @@ static int pkcs11_init_token(Pkcs11Token *tok, pkcs11_token_t *entry)
 
 int tls_pkcs11_open_token(WOLFSSL *ssl)
 {
+
 	WOLFSSL_CTX *ctx = wolfSSL_get_SSL_CTX(ssl);
 	pkcs11_context_t *ctxd = wolfSSL_CTX_get_ex_data(ctx, 0);
 
 	if(ctxd == NULL)
-		return 0;
+		return -1;
 
-	int idx = ctxd->token_id;
-	int devId = 16
-						* (ksr_tcp_main_threads > 0 ? thread_etask_pidx + 1
-													: process_no + 1)
-				+ idx;
+	int idx;
+	idx = ctxd->token_id;
 
-	if(!likely(_pkcs11_devices[idx].used)) {
-		Pkcs11Token *token = &_pkcs11_devices[idx].tok;
 
-		pkcs11_init_token(token, _pkcs11_tokens + idx);
-		_pkcs11_devices[idx].used = devId;
-
-		if(wc_CryptoCb_RegisterDevice(devId, my_FilterPk, token) != 0) {
-			LM_ERR("pkcs11: failed to register runtime devId=%d token='%s'\n",
-					devId, _pkcs11_tokens[idx].token);
-			return -1;
-		}
-
-		wc_Pkcs11Token_Open(token, 0);
-		LM_INFO("Created token:%d for thread:%d\n: devId=%d", idx,
-				thread_etask_pidx, devId);
-	} else {
-		if(likely(_pkcs11_devices[idx].used != devId)) {
-			LM_WARN("pkcs11: device used=%d mismatch (expected devId=%d)\n",
-					_pkcs11_devices[idx].used, devId);
-			return -1;
-		}
-	}
-
-	wolfSSL_use_PrivateKey_Label(ssl, ctxd->private_key, devId);
+	wolfSSL_use_PrivateKey_Label(ssl, ctxd->private_key, idx);
 
 	return 0;
 }
 
-int tls_pkcs11_set_key(WOLFSSL_CTX *ctx, char *key)
+int tls_pkcs11_set_key(WOLFSSL_CTX *ctx, char *key, int check_key)
 {
 	char uri[1024];
 	char token_name[256] = "";
@@ -296,8 +403,17 @@ int tls_pkcs11_set_key(WOLFSSL_CTX *ctx, char *key)
 	char pin_buf[256] = "";
 
 	int i;
+	int found_pin;
 
-	Pkcs11Token *temp_tok;
+	static int inited = 0;
+
+	if(!inited) {
+		for(int k = 0; k < PKCS11_MAX_DEVS; k++) {
+			pthread_mutex_init(&_pkcs11_devices[k].mutex, NULL);
+		}
+
+		inited = 1;
+	}
 
 	if(!ctx || !key) {
 		LM_ERR("tls_pkcs11_set_key: NULL argument\n");
@@ -309,12 +425,22 @@ int tls_pkcs11_set_key(WOLFSSL_CTX *ctx, char *key)
 	}
 	uri_decode(uri, key + 7);
 
-	pkcs11_parse_field(uri, "module=", lib_path, sizeof(lib_path));
-	pkcs11_parse_field(uri, "token=", token_name, sizeof(token_name));
-	pkcs11_parse_field(uri, "object=", obj_name, sizeof(obj_name));
-	if(pkcs11_parse_field(uri, "pin=", pin_raw, sizeof(pin_raw))) {
-		if(!pkcs11_resolve_pin(pin_raw, pin_buf, sizeof(pin_buf)))
-			return -1;
+	pkcs11_parse_field(uri, "module-path=", lib_path, sizeof(lib_path), 1);
+	pkcs11_parse_field(uri, "token=", token_name, sizeof(token_name), 0);
+	pkcs11_parse_field(uri, "object=", obj_name, sizeof(obj_name), 0);
+	if(!(found_pin = pkcs11_parse_field(
+				 uri, "pin-value=", pin_buf, sizeof(pin_buf), 1))) {
+		found_pin =
+				pkcs11_parse_field(uri, "source=", pin_raw, sizeof(pin_raw), 1);
+
+		if(found_pin) {
+			found_pin = pkcs11_resolve_pin(pin_raw, pin_buf, sizeof(pin_buf));
+		}
+	}
+
+	if(!found_pin) {
+		LM_WARN("PIN not found - this will likely lead to error opening "
+				"PKCS#11\n");
 	}
 
 	if(!lib_path[0]) {
@@ -395,47 +521,46 @@ int tls_pkcs11_set_key(WOLFSSL_CTX *ctx, char *key)
 		cur_token->token[127] = '\0';
 
 		strncpy(cur_token->pin, pin_buf, 127);
-		cur_token->token[127] = '\0';
+		cur_token->pin[127] = '\0';
 
 		cur_token->dev = cur_module;
+
+		pkcs11_init_token(&_pkcs11_devices[token_slot].tok, cur_token);
 	}
 
+	int devId = token_slot;
+	Pkcs11Token *token = &_pkcs11_devices[token_slot].tok;
+	pkcs11_context_t *ctxd = NULL;
 
-	pkcs11_context_t *ctxd = wolfSSL_CTX_get_ex_data(ctx, 0);
-	int devId = cur_token->token_id;
+	ctxd = wolfSSL_CTX_get_ex_data(ctx, 0);
 
 	if(ctxd == NULL) {
-		ctxd = (pkcs11_context_t *)malloc(sizeof(pkcs11_context_t));
-		if(ctxd == NULL) {
-			LM_ERR("tls_pkcs11_set_key: no more pkg memory for ctx metadata\n");
-			return -1;
-		}
-		memset(ctxd, 0, sizeof(*ctxd));
-		wolfSSL_CTX_set_ex_data(ctx, 0, ctxd);
+		LM_ERR("tls_pkcs11_set_key: ex data was not allocated!\n");
+		return -1;
 	}
 	ctxd->token_id = cur_token->token_id;
-	;
 	strncpy(ctxd->private_key, obj_name, sizeof(ctxd->private_key) - 1);
 	ctxd->private_key[sizeof(ctxd->private_key) - 1] = '\0';
 
-	temp_tok = &_pkcs11_devices[cur_token->token_id].tok;
-	pkcs11_init_token(temp_tok, cur_token);
-	_pkcs11_devices[cur_token->token_id].used = 1;
-
-	if(wc_CryptoCb_RegisterDevice(devId, my_FilterPk, temp_tok) != 0) {
+	if(wc_CryptoCb_RegisterDevice(devId, my_FilterPk, token) != 0) {
 		LM_ERR("pkcs11: failed to register runtime devId=%d token='%s'\n", 0,
 				token_name);
-		wc_Pkcs11Token_Final(temp_tok);
+		wc_Pkcs11Token_Final(token);
 		return -1;
+	} else {
 	}
-
 
 	/* Create a temporary SSL object for the cert/key check.
 	 * Must not place any token in the SSL context as this causes run time
 	 * errors when the thread tries to use its specific token.
 	*/
-	WOLFSSL *ssl = wolfSSL_new(ctx);
+
 	/* Bind the crypto device to this SSL context */
+	if(!check_key) {
+		return 0;
+	}
+	WOLFSSL *ssl;
+	ssl = wolfSSL_new(ctx);
 	if(wolfSSL_SetDevId(ssl, devId) != WOLFSSL_SUCCESS) {
 		LM_ERR("tls_pkcs11_set_key: wolfSSL_SetDevId failed"
 			   " devId=%d\n",
@@ -458,7 +583,6 @@ int tls_pkcs11_set_key(WOLFSSL_CTX *ctx, char *key)
 	}
 
 	wolfSSL_free(ssl);
-
 	LM_INFO("tls_pkcs11_set_key[%p]: key loaded token='%s' object='%s'"
 			" devId=%d : private key matches cert!\n",
 			ctx, token_name, obj_name, devId);

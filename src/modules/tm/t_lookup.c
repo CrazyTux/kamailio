@@ -128,6 +128,7 @@ static int T_branch = 0;
  */
 msg_ctx_id_t tm_global_ctx_id = {0};
 
+extern int _tm_reply_matching;
 
 struct cell *get_t()
 {
@@ -1361,6 +1362,8 @@ int t_reply_matching(struct sip_msg *p_msg, int *p_branch)
 	int loopl;
 
 	short is_cancel;
+	short is_local_cancel;
+	short is_cinv_rpl; /* 1xx or negative final reply to a canceled INVITE */
 
 	/* make compiler warnings happy */
 	loopi = 0;
@@ -1467,6 +1470,16 @@ int t_reply_matching(struct sip_msg *p_msg, int *p_branch)
 		if(unlikely(branch_id >= p_cell->nr_of_outgoings))
 			continue;
 
+		is_local_cancel = is_cancel && is_invite(p_cell)
+						  && p_cell->uac[branch_id].local_cancel.buffer_len;
+		is_cinv_rpl =
+				is_invite(p_cell) && cseq_method.len == INVITE_LEN
+				&& memcmp(cseq_method.s, INVITE, INVITE_LEN) == 0
+				&& ((p_msg->REPLY_STATUS >= 100 && p_msg->REPLY_STATUS < 200)
+						|| (p_msg->REPLY_STATUS >= 300
+								&& p_msg->REPLY_STATUS < 700))
+				&& (p_cell->uac[branch_id].request.flags & F_RB_CANCELED);
+
 		/* does method match ? (remember -- CANCELs have the same branch
 		 * as canceled transactions) */
 		req_method = p_cell->method;
@@ -1476,15 +1489,7 @@ int t_reply_matching(struct sip_msg *p_msg, int *p_branch)
 									 cseq_method.len)
 									 == 0)
 						/* or it is a local cancel */
-						|| (is_cancel
-								&& is_invite(p_cell)
-								/* commented out -- should_cancel_branch set it to
-						 * BUSY_BUFFER to avoid collisions with replies;
-						 * thus, we test here by buffer size
-						 */
-								/* && p_cell->uac[branch_id].local_cancel.buffer ))) */
-								&& p_cell->uac[branch_id]
-										   .local_cancel.buffer_len)))
+						|| is_local_cancel))
 			continue;
 
 		if(cfg_get(tm, tm_cfg, callid_matching) && p_cell->uas.request
@@ -1503,12 +1508,26 @@ int t_reply_matching(struct sip_msg *p_msg, int *p_branch)
 			continue;
 		}
 
+		if(_tm_reply_matching & TM_REPLY_MATCHING_ACTIVE) {
+			/* Replies for a local CANCEL, and INVITE replies needed to send a
+			 * deferred branch CANCEL or ACK its negative final response, can
+			 * arrive after the INVITE is in WAIT. */
+			if(unlikely((p_cell->flags & T_IN_AGONY)
+						|| (t_on_wait(p_cell) && !is_local_cancel
+								&& !is_cinv_rpl))) {
+				LM_INFO("skipping late reply match for transaction already in "
+						"terminated phase: T=%p wait=%d flags=0x%x\n",
+						p_cell, t_on_wait(p_cell), p_cell->flags);
+				continue;
+			}
+		}
+
 		/* passed all disqualifying factors - the transaction has been matched */
 		set_t(p_cell, (int)branch_id);
 		*p_branch = (int)branch_id;
 		REF_UNSAFE(T);
 		UNLOCK_HASH(hash_index);
-		LM_DBG("reply (%p) matched an active transaction (T=%p)!\n", p_msg, T);
+		LM_DBG("reply (%p) matched a valid transaction (T=%p)!\n", p_msg, T);
 		if(likely(!(p_msg->msg_flags & FL_TM_RPL_MATCHED))) {
 			/* if this is a 200 for INVITE, we will wish to store to-tags to be
 			 * able to distinguish retransmissions later and not to call
@@ -1785,7 +1804,7 @@ static inline void init_new_t(struct cell *new_cell, struct sip_msg *p_msg)
 	new_cell->on_failure = get_on_failure();
 	new_cell->on_branch_failure = get_on_branch_failure();
 	new_cell->on_reply = get_on_reply();
-	new_cell->end_of_life = get_ticks_raw() + lifetime;
+	new_cell->end_of_life = tm_get_ticks_raw() + lifetime;
 	;
 	new_cell->fr_timeout =
 			(ticks_t)get_msgid_val(user_fr_timeout, p_msg->id, int);
@@ -1807,6 +1826,16 @@ static inline void init_new_t(struct cell *new_cell, struct sip_msg *p_msg)
 		} else {
 			new_cell->fr_inv_timeout = cfg_get(tm, tm_cfg, fr_inv_timeout);
 		}
+	}
+	/* diagnostics for tracking transaction attributes */
+	if((_tm_debug_mode & TM_DEBUG_MODE_INVSEND)
+			&& (p_msg->REQ_METHOD == METHOD_INVITE)) {
+		LM_INFO("diagnostics: initialized transaction=%p on_failure=%d "
+				"fr_timeout=%u ticks (%u ms) fr_inv_timeout=%u ticks (%u ms) "
+				"end_of_life=%u ticks\n",
+				new_cell, new_cell->on_failure, new_cell->fr_timeout,
+				TICKS_TO_MS(new_cell->fr_timeout), new_cell->fr_inv_timeout,
+				TICKS_TO_MS(new_cell->fr_inv_timeout), new_cell->end_of_life);
 	}
 	new_cell->rt_t1_timeout_ms = (retr_timeout_t)get_msgid_val(
 			user_rt_t1_timeout_ms, p_msg->id, int);
@@ -2057,7 +2086,7 @@ int t_unref(struct sip_msg *p_msg)
 		return -1;
 	if(p_msg->first_line.type == SIP_REQUEST) {
 		kr = get_kr();
-		if(unlikely(kr == REQ_ERR_DELAYED)) {
+		if(unlikely(kr & REQ_ERR_DELAYED)) {
 			LM_DBG("delayed error reply generation(%d)\n", tm_error);
 			if(unlikely(is_route_type(FAILURE_ROUTE))) {
 				LM_BUG("called w/ kr=REQ_ERR_DELAYED in failure"
@@ -2074,13 +2103,12 @@ int t_unref(struct sip_msg *p_msg)
 								   && !(kr & REQ_RLSD)))) {
 			LM_WARN("script writer didn't release transaction\n");
 			t_release_transaction(T);
-		} else if(unlikely((kr & REQ_ERR_DELAYED)
-						   && (kr
-								   & ~(REQ_RLSD | REQ_RPLD | REQ_ERR_DELAYED
-										   | REQ_FWDED)))) {
-			LM_BUG("REQ_ERR DELAYED should have been caught much"
-				   " earlier for %p: %d (hex %x)\n",
-					T, kr, kr);
+		} else if(unlikely(T->nr_of_outgoings == 0
+						   && !(kr & (REQ_RPLD | REQ_RLSD))
+						   && !(T->flags & T_IN_AGONY))) {
+			LM_WARN("dropping orphaned transaction without branches"
+					" T=%p kr=%d\n",
+					T, kr);
 			t_release_transaction(T);
 		}
 	}

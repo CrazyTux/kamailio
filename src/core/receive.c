@@ -55,6 +55,7 @@
 #include "tcp_options.h" /* for access to tcp_accept_aliases*/
 #include "cfg/cfg.h"
 #include "core_stats.h"
+#include "worker_stats.h"
 #include "kemi.h"
 
 #ifdef DEBUG_DMALLOC
@@ -158,6 +159,14 @@ str kemi_received_route_callback = STR_NULL;
 sr_net_info_t *ksr_evrt_rcvnetinfo_get(void)
 {
 	return ksr_evrt_rcvnetinfo;
+}
+
+/**
+ *
+ */
+void ksr_evrt_rcvnetinfo_set(sr_net_info_t *netinfo)
+{
+	ksr_evrt_rcvnetinfo = netinfo;
 }
 
 /**
@@ -323,6 +332,15 @@ int receive_msg(char *buf, unsigned int len, receive_info_t *rcv_info)
 		return -1;
 	}
 
+	if(len >= BUF_SIZE) {
+		LM_ERR("message exceeding maximum size: %d\n", (int)BUF_SIZE);
+		return -1;
+	}
+
+	/* busy from here on - every later exit goes through end: or error00: */
+	KSR_POOL_MEMBER_ONCE(ksr_cnt_sip_children);
+	counter_inc(ksr_cnt_busy_children);
+
 	if(ksr_evrt_received_mode & KSR_EVRT_RECEIVED_MESSAGE) {
 		if(ksr_evrt_received(buf, &len, rcv_info, KSR_EVRT_RECEIVED_MESSAGE)
 				< 0) {
@@ -397,6 +415,9 @@ int receive_msg(char *buf, unsigned int len, receive_info_t *rcv_info)
 				< 0)) {
 		LOG(cfg_get(core, core_cfg, sip_parser_log),
 				"parsing relevant headers failed\n");
+		if(sr_core_ert_run(msg, SR_CORE_ERT_RECEIVE_PARSE_ERROR) < 0) {
+			goto error02;
+		}
 	}
 	LM_DBG("--- received sip message - %s - call-id: [%.*s] - cseq: [%.*s]\n",
 			(msg->first_line.type == SIP_REQUEST) ? "request" : "reply",
@@ -640,6 +661,7 @@ int receive_msg(char *buf, unsigned int len, receive_info_t *rcv_info)
 	}
 
 end:
+	counter_add(ksr_cnt_busy_children, -1);
 	ksr_msg_env_reset();
 	LM_DBG("cleaning up\n");
 	free_sip_msg(msg);
@@ -663,6 +685,7 @@ error02:
 	free_sip_msg(msg);
 	pkg_free(msg);
 error00:
+	counter_add(ksr_cnt_busy_children, -1);
 	ksr_msg_env_reset();
 	/* reset log prefix */
 	log_prefix_set(NULL);

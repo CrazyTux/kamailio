@@ -21,6 +21,14 @@
  * key format: pkcs11:token=<name>;slot=<name>;object=<label>[;module-path=<lib>]
  * Returns 1 on success, 0 on failure.
  */
-int tls_pkcs11_set_key(WOLFSSL_CTX *ctx, char *key);
+int tls_pkcs11_set_key(WOLFSSL_CTX *ctx, char *key, int check_key);
+int tls_pkcs11_open_token(WOLFSSL *ssl);
 
+typedef struct
+{
+	int token_id;
+	char config_key[256];
+	char private_key[256];
+	int *index;
+} pkcs11_context_t;
 #endif /* WOLFSSL_PKCS11_H */

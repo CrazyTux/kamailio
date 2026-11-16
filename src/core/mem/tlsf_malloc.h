@@ -16,6 +16,10 @@
 **
 ** This implementation was written to the specification
 ** of the document, therefore no GPL restrictions apply.
+**
+** As some of the links are not working anymore, here the link to the
+** original research paper:
+** http://www.gii.upv.es/tlsf/files/papers/ecrts04_tlsf.pdf
 */
 
 #include <stddef.h>
@@ -51,6 +55,8 @@ extern "C"
 			const char *function, unsigned int line, const char *mname);
 	void *tlsf_mallocxz(tlsf_t tlsf, size_t size, const char *file,
 			const char *function, unsigned int line, const char *mname);
+	void *tlsf_mallocxn(tlsf_t tlsf, size_t size, const char *file,
+			const char *function, unsigned int line, const char *mname);
 	void *tlsf_realloc(tlsf_t tlsf, void *ptr, size_t size, const char *file,
 			const char *function, unsigned int line, const char *mname);
 	void *tlsf_reallocxf(tlsf_t tlsf, void *ptr, size_t size, const char *file,
@@ -60,6 +66,7 @@ extern "C"
 #else
 void *tlsf_malloc(tlsf_t tlsf, size_t bytes);
 void *tlsf_mallocxz(tlsf_t tlsf, size_t bytes);
+void *tlsf_mallocxn(tlsf_t tlsf, size_t bytes);
 void *tlsf_realloc(tlsf_t tlsf, void *ptr, size_t size);
 void *tlsf_reallocxf(tlsf_t tlsf, void *ptr, size_t size);
 void tlsf_free(tlsf_t tlsf, void *ptr);

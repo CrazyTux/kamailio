@@ -531,6 +531,7 @@ int check_self_uri(sip_uri_t *puri)
  *                 - send_info->send_flags is filled from the message
  *                 - if the send_socket member is null, a send_socket will be
  *                   chosen automatically
+ *   bindex    - branch index
  *   mbmode    - message build mode (for build_req_buf_from_sip_req())
  * WARNING: don't forget to zero-fill all the  unused members (a non-zero
  * random id along with proto==PROTO_TCP can have bad consequences, same for
@@ -539,12 +540,13 @@ int check_self_uri(sip_uri_t *puri)
  * return: 0 (E_OK) on success; negative (E_*) on failure
  */
 int forward_request_mode(struct sip_msg *msg, str *dst, unsigned short port,
-		struct dest_info *send_info, unsigned int mbmode)
+		struct dest_info *send_info, int bindex, unsigned int mbmode)
 {
 	unsigned int len;
 	char *buf;
 	char md5[MD5_LEN];
 	struct socket_info *orig_send_sock; /* initial send_sock */
+	struct socket_info *map_send_sock;
 	int ret;
 	struct ip_addr ip; /* debugging only */
 	char proto;
@@ -598,7 +600,7 @@ int forward_request_mode(struct sip_msg *msg, str *dst, unsigned short port,
 		goto error;
 	}
 	msg->hash_index = hash(msg->callid->body, get_cseq(msg)->number);
-	if(!branch_builder(msg->hash_index, 0, md5, NULL, 0 /* 0-th branch */,
+	if(!branch_builder(msg->hash_index, 0, md5, NULL, bindex /* n-th branch */,
 			   msg->add_to_branch_s, &msg->add_to_branch_len)) {
 		LM_ERR("branch_builder failed\n");
 		ret = E_UNSPEC;
@@ -609,8 +611,17 @@ int forward_request_mode(struct sip_msg *msg, str *dst, unsigned short port,
 #ifdef USE_DNS_FAILOVER
 	do {
 #endif
-		if(orig_send_sock == 0) /* no forced send_sock => find it **/
+		map_send_sock = send_socket_map_get(&msg->force_send_socket_map, proto);
+		if(map_send_sock) {
+			send_info->send_sock =
+					get_send_socket2(map_send_sock, &send_info->to, proto, 0);
+			send_info->send_flags.f |= SND_F_FORCE_SOCKET;
+		} else if(orig_send_sock == 0) {
+			/* no forced send_sock => find it */
+			if(msg->force_send_socket == 0)
+				send_info->send_flags.f &= ~SND_F_FORCE_SOCKET;
 			send_info->send_sock = get_send_socket(msg, &send_info->to, proto);
+		}
 		if(send_info->send_sock == 0) {
 			LM_ERR("cannot forward to af %d, proto %d "
 				   "no corresponding listening socket\n",
@@ -743,7 +754,7 @@ end:
 int forward_request(struct sip_msg *msg, str *dst, unsigned short port,
 		struct dest_info *send_info)
 {
-	return forward_request_mode(msg, dst, port, send_info, 0);
+	return forward_request_mode(msg, dst, port, send_info, 0, 0);
 }
 
 
@@ -776,7 +787,8 @@ int forward_request_uac(struct sip_msg *msg, str *dst, unsigned short port,
 
 	msg_flags_bk = msg->msg_flags;
 	msg->msg_flags |= FL_VIA_NORECEIVED;
-	ret = forward_request_mode(msg, dst, port, send_info, BUILD_NO_VIA1_UPDATE);
+	ret = forward_request_mode(
+			msg, dst, port, send_info, 0, BUILD_NO_VIA1_UPDATE);
 	msg->msg_flags = msg_flags_bk;
 
 	return ret;
@@ -785,7 +797,7 @@ int forward_request_uac(struct sip_msg *msg, str *dst, unsigned short port,
 /**
  * forward request like initial uac sender, with only one via
  */
-int forward_uac_uri(sip_msg_t *msg, str *vuri)
+int forward_uac_uri(sip_msg_t *msg, str *vuri, int bindex)
 {
 	int ret;
 	dest_info_t dst;
@@ -837,7 +849,7 @@ int forward_uac_uri(sip_msg_t *msg, str *vuri)
 	msg_flags_bk = msg->msg_flags;
 	msg->msg_flags |= FL_VIA_NORECEIVED;
 	ret = forward_request_mode(
-			msg, &u->host, u->port_no, &dst, BUILD_NO_VIA1_UPDATE);
+			msg, &u->host, u->port_no, &dst, bindex, BUILD_NO_VIA1_UPDATE);
 	msg->msg_flags = msg_flags_bk;
 
 	return ret;
@@ -951,7 +963,7 @@ static int do_forward_reply(struct sip_msg *msg, int mode)
 		goto error;
 	}
 
-	new_buf = build_res_buf_from_sip_res(msg, &new_len);
+	new_buf = build_res_buf_from_sip_res(msg, &new_len, 0);
 	if(!new_buf) {
 		LM_ERR("building failed\n");
 		goto error;
@@ -1048,7 +1060,13 @@ int forward_reply_nocb(struct sip_msg *msg)
 
 static void apply_force_send_socket(struct dest_info *dst, struct sip_msg *msg)
 {
-	if(msg->force_send_socket != 0) {
+	struct socket_info *map_send_sock;
+
+	map_send_sock =
+			send_socket_map_get(&msg->force_send_socket_map, dst->proto);
+	if(msg->force_send_socket != 0 || map_send_sock != 0) {
 		dst->send_sock = get_send_socket(msg, &dst->to, dst->proto);
+		if(map_send_sock != 0)
+			dst->send_flags.f |= SND_F_FORCE_SOCKET;
 	}
 }

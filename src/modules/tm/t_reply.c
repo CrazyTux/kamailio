@@ -1649,6 +1649,9 @@ static enum rps t_should_relay_response(struct cell *Trans, int new_code,
 								: branch;
 		if(new_code >= 200) {
 			prepare_to_cancel(Trans, &cancel_data->cancel_bitmap, 0);
+			/* still under REPLY_LOCK - mark INVITE branches without reply as
+			 * canceled, to send the CANCEL on their first provisional reply */
+			defer_cancel_unreplied(Trans, &cancel_data->cancel_bitmap);
 			cancel_data->reason.cause = new_code;
 			LM_DBG("rps completed - uas status: %d\n", Trans->uas.status);
 			return RPS_COMPLETED;
@@ -1698,7 +1701,7 @@ branches_failed:
  */
 int t_retransmit_reply(struct cell *t)
 {
-	static char b[BUF_SIZE];
+	static char b[BUF_SIZE + 1];
 	int len;
 
 	/* first check if we managed to resolve topmost Via
@@ -2073,7 +2076,7 @@ enum rps relay_reply(struct cell *t, struct sip_msg *p_msg, int branch,
 				relayed_msg =
 						FAKED_REPLY; /* mark the relayed_msg as a "FAKE" */
 			} else {
-				buf = build_res_buf_from_sip_res(relayed_msg, &res_len);
+				buf = build_res_buf_from_sip_res(relayed_msg, &res_len, 0);
 				/* if we build a message from shmem, we need to remove
 				 * via delete lumps which are now stirred in the shmem-ed
 				 * structure
@@ -2531,6 +2534,16 @@ int reply_received(struct sip_msg *p_msg)
 					}
 					shm_free(ack);
 				}
+				/* The upstream transaction is already complete. This reply was
+				 * matched only to ACK the negative final response on the canceled
+				 * branch; do not run normal reply processing for it. */
+				if(msg_status < 700 && t->uas.status >= 200
+						&& (uac->request.flags & F_RB_CANCELED)) {
+					LM_DBG("negative final reply for canceled branch consumed "
+						   "after "
+						   "ACK handling\n");
+					goto done;
+				}
 			} else if(is_local(t) /*&& 200 <= msg_status < 300*/) {
 				ack = build_local_ack(p_msg, t, branch, &ack_len, &lack_dst);
 				if(ack) {
@@ -2586,6 +2599,8 @@ int reply_received(struct sip_msg *p_msg)
 					cancel_data.reason.cause = (t->uas.status >= 200)
 													   ? t->uas.status
 													   : CANCEL_REAS_UNKNOWN;
+					/* same reason text as for cancel_uacs() */
+					cancel_reason_text(&cancel_data);
 					cancel_branch(t, branch, NULL, &cancel_data.reason,
 							F_CANCEL_B_FORCE_C);
 				}

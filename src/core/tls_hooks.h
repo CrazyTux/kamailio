@@ -78,13 +78,26 @@ typedef struct tls_hooks
 	int (*pre_init)(void);
 	/* match the given connection TLS domain
 	 * with the TLS domain looked up by ip:port
-	 * see: _tcpconn_find */
+	 * see: _tcpconn_find
+	 * mode 2: in tcp main, the module takes the connect request's tls
+	 * attributes from tcp_reactor_connect_info() */
 	int (*match_domain)(
 			struct tcp_connection *c, struct ip_addr *ip, unsigned short port);
 	/* match connections TLS domain
 	 * see: _tcpconn_add_alias_unsafe */
 	int (*match_connections_domain)(
 			struct tcp_connection *l_c, struct tcp_connection *r_c);
+	/* mode 2: run the tls:connection-out event route for c in the calling
+	 * (worker) process - a single-threaded config context. Set by the tls
+	 * module to tls_run_event_routes. Invoked by the reactor worker when it
+	 * receives a F_TCP_REQ_TLS_EVENT dispatch task (the SSL metadata the route
+	 * reads is already cached in shm c->extra_data). */
+	int (*run_event_route)(struct tcp_connection *c);
+	/* mode 2: copy the outbound tls attributes of the calling worker
+	 * (server_name, server_id) into ci as shm strings, owned by ci. Invoked
+	 * by tcp_reactor_connect_put(); tcp main moves them to the new
+	 * connection's cinfo before the handshake. */
+	void (*connect_info)(ksr_coninfo_t *ci);
 } tls_hooks_t;
 
 

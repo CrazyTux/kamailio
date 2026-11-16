@@ -25,7 +25,7 @@
 
 #include "../../core/pvar.h"
 
-#define UACREG_TABLE_VERSION 5
+#define UACREG_TABLE_VERSION 6
 
 #define UACREG_REQTO_MASK_USER 1
 #define UACREG_REQTO_MASK_AUTH 2
@@ -46,7 +46,10 @@ typedef struct _reg_uac
 	str auth_ha1;
 	str callid;
 	str contact_addr;
+	str contact_user;
 	str socket;
+	send_socket_map_t sockmap;
+	int usesockmap;
 	unsigned int cseq;
 	unsigned int flags;
 	unsigned int expires;

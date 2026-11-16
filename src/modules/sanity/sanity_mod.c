@@ -33,8 +33,11 @@
 #include "../../core/kemi.h"
 #include "../../core/parser/parse_from.h"
 #include "../../core/parser/parse_to.h"
+#include "../../core/parser/parse_cseq.h"
 #include "../../core/parser/contact/contact.h"
 #include "../../core/parser/contact/parse_contact.h"
+#include "../../core/parser/parse_rr.h"
+#include "../../core/parser/parse_ppi_pai.h"
 
 MODULE_VERSION
 
@@ -52,10 +55,14 @@ int sn_size_ruri = 256;
 int sn_size_from_uri = 256;
 int sn_size_to_uri = 256;
 int sn_size_contact_uri = 256;
+int sn_size_route_uri = 256;
+int sn_size_path_uri = 256;
+int sn_size_pai_uri = 256;
 int sn_size_header = 2048;
 int sn_size_headers = 8192;
 int sn_size_body = 8192;
 int sn_size_message = 16384;
+int sn_size_method = 32;
 
 str_list_t *proxyrequire_list = NULL;
 
@@ -90,14 +97,18 @@ static param_export_t params[] = {
 	{"default_checks", PARAM_INT, &default_msg_checks},
 	{"uri_checks", PARAM_INT, &default_uri_checks},
 	{"size_checks", PARAM_INT, &sn_size_checks},
+	{"size_message", PARAM_INT, &sn_size_message},
+	{"size_method", PARAM_INT, &sn_size_method},
 	{"size_ruri", PARAM_INT, &sn_size_ruri},
 	{"size_from_uri", PARAM_INT, &sn_size_from_uri},
 	{"size_to_uri", PARAM_INT, &sn_size_to_uri},
 	{"size_contact_uri", PARAM_INT, &sn_size_contact_uri},
+	{"size_route_uri", PARAM_INT, &sn_size_route_uri},
+	{"size_path_uri", PARAM_INT, &sn_size_path_uri},
+	{"size_pai_uri", PARAM_INT, &sn_size_pai_uri},
 	{"size_header", PARAM_INT, &sn_size_header},
 	{"size_headers", PARAM_INT, &sn_size_headers},
 	{"size_body", PARAM_INT, &sn_size_body},
-	{"size_message", PARAM_INT, &sn_size_message},
 	{"proxy_require", PARAM_STR, &_sanity_prval},
 	{"autodrop", PARAM_INT, &_sanity_drop},
 	{"noreply", PARAM_INT, &ksr_sanity_noreply},
@@ -158,7 +169,10 @@ int sanity_check_sizes(sip_msg_t *msg)
 {
 	str s;
 	contact_t *cb = NULL;
+	rr_t *rb = NULL;
 	hdr_field_t *hf = NULL;
+	p_id_body_t *pib = NULL;
+	int i = 0;
 
 	if(sn_size_message > 0) {
 		if(msg->len > sn_size_message) {
@@ -166,19 +180,34 @@ int sanity_check_sizes(sip_msg_t *msg)
 		}
 	}
 	if(sn_size_ruri > 0) {
-		if(msg->new_uri.s) {
-			if(msg->new_uri.len > sn_size_ruri) {
-				return SANITY_CHECK_FAILED;
-			}
-		} else {
-			if(msg->first_line.u.request.uri.len > sn_size_ruri) {
-				return SANITY_CHECK_FAILED;
+		if(msg->first_line.type == SIP_REQUEST) {
+			if(msg->new_uri.s) {
+				if(msg->new_uri.len > sn_size_ruri) {
+					return SANITY_CHECK_FAILED;
+				}
+			} else {
+				if(msg->first_line.u.request.uri.len > sn_size_ruri) {
+					return SANITY_CHECK_FAILED;
+				}
 			}
 		}
 	}
 	if(parse_headers(msg, HDR_EOH_F, 0) == -1) {
 		LM_ERR("failed to parse to end of headers\n");
 		return SANITY_CHECK_FAILED;
+	}
+	if(sn_size_method > 0) {
+		if(msg->first_line.type == SIP_REQUEST) {
+			if(msg->first_line.u.request.method.len > sn_size_method) {
+				return SANITY_CHECK_FAILED;
+			}
+		} else {
+			if(msg->cseq != NULL) {
+				if(get_cseq(msg)->method.len > sn_size_method) {
+					return SANITY_CHECK_FAILED;
+				}
+			}
+		}
 	}
 	if(sn_size_header > 0) {
 		for(hf = msg->headers; hf != NULL; hf = hf->next) {
@@ -209,7 +238,7 @@ int sanity_check_sizes(sip_msg_t *msg)
 			LM_WARN("no To header\n");
 			return SANITY_CHECK_FAILED;
 		}
-		if(get_to(msg)->uri.len > sn_size_from_uri) {
+		if(get_to(msg)->uri.len > sn_size_to_uri) {
 			return SANITY_CHECK_FAILED;
 		}
 	}
@@ -248,6 +277,75 @@ int sanity_check_sizes(sip_msg_t *msg)
 					}
 				}
 			}
+		}
+	}
+	if(sn_size_route_uri > 0) {
+		if(parse_route_headers(msg) < 0) {
+			LM_DBG("failed to parse Route headers\n");
+			return SANITY_CHECK_FAILED;
+		}
+		for(hf = msg->route; hf != NULL; hf = next_sibling_hdr(hf)) {
+			if(hf->type == HDR_ROUTE_T) {
+				for(rb = (rr_t *)hf->parsed; rb != NULL; rb = rb->next) {
+					if(rb->nameaddr.uri.len > sn_size_route_uri) {
+						return SANITY_CHECK_FAILED;
+					}
+				}
+			}
+		}
+		if(parse_record_route_headers(msg) < 0) {
+			LM_DBG("failed to parse Record-Route headers\n");
+			return SANITY_CHECK_FAILED;
+		}
+		for(hf = msg->record_route; hf != NULL; hf = next_sibling_hdr(hf)) {
+			if(hf->type == HDR_RECORDROUTE_T) {
+				for(rb = (rr_t *)hf->parsed; rb != NULL; rb = rb->next) {
+					if(rb->nameaddr.uri.len > sn_size_route_uri) {
+						return SANITY_CHECK_FAILED;
+					}
+				}
+			}
+		}
+	}
+	if(sn_size_path_uri > 0) {
+		if(parse_headers(msg, HDR_PATH_F, 0) < 0) {
+			LM_DBG("failed to parse Path headers\n");
+			return SANITY_CHECK_FAILED;
+		}
+		for(hf = msg->path; hf != NULL; hf = next_sibling_hdr(hf)) {
+			if(hf->type == HDR_PATH_T) {
+				if(parse_rr(hf) < 0) {
+					LM_DBG("failed to parse Path header body\n");
+					return SANITY_CHECK_FAILED;
+				}
+				for(rb = (rr_t *)hf->parsed; rb != NULL; rb = rb->next) {
+					if(rb->nameaddr.uri.len > sn_size_path_uri) {
+						return SANITY_CHECK_FAILED;
+					}
+				}
+			}
+		}
+	}
+	if(sn_size_pai_uri > 0) {
+		if(parse_pai_header(msg) == 0) {
+			for(hf = msg->pai; hf != NULL; hf = next_sibling_hdr(hf)) {
+				if(hf->type == HDR_PAI_T) {
+					pib = (p_id_body_t *)hf->parsed;
+					if(pib == NULL) {
+						LM_DBG("failed to parse P-Asserted-Identity header "
+							   "body\n");
+						return SANITY_CHECK_FAILED;
+					}
+					for(i = 0; i < pib->num_ids; i++) {
+						if(pib->id[i].uri.len > sn_size_pai_uri) {
+							return SANITY_CHECK_FAILED;
+						}
+					}
+				}
+			}
+		} else if(msg->pai != NULL) {
+			LM_DBG("failed to parse P-Asserted-Identity headers\n");
+			return SANITY_CHECK_FAILED;
 		}
 	}
 	if(sn_size_header > 0) {
@@ -298,8 +396,8 @@ int sanity_check(struct sip_msg *_msg, int msg_checks, int uri_checks)
 			&& (ret = check_via1_header(_msg)) != SANITY_CHECK_PASSED) {
 		goto done;
 	}
-	if(SANITY_VIA1_BRANCH & msg_checks
-			&& (ret = check_via1_branch(_msg)) != SANITY_CHECK_PASSED) {
+	if(SANITY_RFC3261_COMPLIANCE & msg_checks
+			&& (ret = check_rfc3261_compliance(_msg)) != SANITY_CHECK_PASSED) {
 		goto done;
 	}
 	if(SANITY_VIA_SIP_VERSION & msg_checks

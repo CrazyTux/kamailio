@@ -30,6 +30,7 @@
 #ifndef _DISPATCH_H_
 #define _DISPATCH_H_
 
+#include <stdint.h>
 #include <stdio.h>
 #include <sys/time.h>
 #include "../../core/pvar.h"
@@ -85,12 +86,15 @@
 #define DS_DNS_MODE_TIMER  (1<<2)
 #define DS_DNS_MODE_QSRV   (1<<3)
 
+#define DS_DNS_MAX_ADDRS 32
+
 #define DS_STATE_MODE_SET  1
 #define DS_STATE_MODE_FUNC (1<<1)
 
 #define DS_EVRTMODE_RUNTIME 0
-#define DS_EVRTMODE_OPTIONS 1
-#define DS_EVRTMODE_INIT 2
+#define DS_EVRTMODE_OPTIONS (1 << 0)
+#define DS_EVRTMODE_INIT    (1 << 1)
+#define DS_EVRTMODE_LOAD    (1 << 2)
 
 #define DS_SELRES_FAILED (ds_selres_t){0}
 
@@ -132,6 +136,11 @@ extern str ds_xavp_dst_dstidx;
 extern str ds_xavp_dst_dstid;
 extern str ds_xavp_dst_attrs;
 extern str ds_xavp_dst_sock;
+extern str ds_xavp_dst_sockmap_set;
+extern str ds_xavp_dst_sockmap_udp;
+extern str ds_xavp_dst_sockmap_tcp;
+extern str ds_xavp_dst_sockmap_tls;
+extern str ds_xavp_dst_sockmap_sctp;
 extern str ds_xavp_dst_socket;
 extern str ds_xavp_dst_sockname;
 
@@ -169,27 +178,47 @@ int ds_reload_db(void);
 int ds_destroy_list(void);
 int ds_select_dst_limit(sip_msg_t *msg, int set, int alg, uint32_t limit,
 		int mode, ds_selres_t *sres);
+int ds_select_dns(sip_msg_t *msg, uint32_t limit);
 int ds_select_routes_limit(
 		sip_msg_t *msg, str *srules, str *smode, int rlimit, ds_selres_t *sres);
 int ds_select_dst(struct sip_msg *msg, int set, int alg, int mode);
 int ds_update_dst(struct sip_msg *msg, int upos, int mode);
 int ds_add_dst(int group, str *address, int flags, int priority, str *attrs);
 int ds_remove_dst(int group, str *address);
+int ds_update_dst_record(
+		int group, str *address, int flags, int priority, str *attrs);
+int ds_pressure_dec(int group, str *address, uint32_t *pressure);
+int ds_pressure_inc(int group, str *address, uint32_t *pressure);
+int ds_pressure_set(
+		int group, str *address, uint32_t value, uint32_t *pressure);
+int ds_weight_set(int group, int *weights, int count);
+int ds_rweight_set(int group, int *rweights, int count);
 int ds_update_state(sip_msg_t *msg, int group, str *address, str *iuid,
 		int state, int mode, ds_rctx_t *rctx);
 int ds_reinit_state(int group, str *address, str *iuid, int state);
 int ds_reinit_state_all(int group, int state);
+int ds_run_init_event_routes(void);
 int ds_reinit_duid_state(int group, str *vduid, int state);
 int ds_mark_dst(struct sip_msg *msg, int state);
 int ds_mark_dst_mode(struct sip_msg *msg, int state, int mode);
 int ds_mark_addr(sip_msg_t *msg, int state, int group, str *uri, int mode);
 int ds_print_list(FILE *fout);
-int ds_log_sets(void);
 int ds_list_exist(int set);
 int ds_is_active_uri(sip_msg_t *msg, int group, str *uri);
 
 int ds_load_unset(struct sip_msg *msg);
+int ds_load_unset_callid(struct sip_msg *msg, str *callid);
 int ds_load_update(struct sip_msg *msg);
+int ds_load_add_record(int group, str *duid, str *callid, int state,
+		unsigned int expire, unsigned int initexpire);
+int ds_load_set_record(int group, str *duid, str *callid, int set_state,
+		int state, int set_expire, unsigned long expire, int set_initexpire,
+		unsigned long initexpire);
+int ds_load_remove_match(int group, str *duid, str *callid);
+struct _ds_cell;
+typedef int (*ds_load_cell_cb_t)(
+		unsigned int slot, const struct _ds_cell *cell, void *param);
+int ds_load_for_each(ds_load_cell_cb_t callback, void *param);
 
 int ds_hash_load_init(unsigned int htsize, int expire, int initexpire);
 int ds_hash_load_destroy(void);
@@ -216,6 +245,8 @@ void ds_dns_timer(unsigned int ticks, void *param);
  * Check if the reply-code is valid:
  */
 int ds_ping_check_rplcode(int);
+int ds_ping_check_rplcode_list(int code, int *codes, int cnt);
+int ds_parse_reply_codes_list(str *input, int **pcodes);
 
 /* clang-format off */
 typedef struct _ds_attrs {
@@ -224,6 +255,7 @@ typedef struct _ds_attrs {
 	str socket;
 	str ping_socket;
 	str sockname;
+	str sockmap;
 	int maxload;
 	int weight;
 	int rweight;
@@ -231,6 +263,8 @@ typedef struct _ds_attrs {
 	str ping_from;
 	str obproxy;
 	int rpriority;
+	int *ping_reply_codes; /*!< per-destination accepted ping reply codes (NULL=use global) */
+	int ping_reply_codes_cnt;
 } ds_attrs_t;
 
 typedef struct _ds_latency_stats {
@@ -264,12 +298,16 @@ typedef struct _ds_dest {
 	str host;         /*!< shortcut to host part */
 	int flags;        /*!< flags */
 	int priority;     /*!< priority */
+	uint32_t pressure; /*!< routing pressure (initialized from attributes) */
 	int dload;        /*!< load */
 	ds_attrs_t attrs; /*!< the attributes */
 	ds_latency_stats_t latency_stats; /*!< latency statistics */
 	int irmode;       /*!< internal runtime mode (flags) */
 	struct socket_info *sock; /*!< pointer to local socket */
-	struct ip_addr ip_address; 	/*!< IP of the address */
+	send_socket_map_t sockmap; /*!< local socket map by transport */
+	struct ip_addr ip_address; 	/*!< IP of the address (first resolved) */
+	struct ip_addr ip_addrs[DS_DNS_MAX_ADDRS]; /*!< all resolved IP addresses */
+	int ip_addrs_num;          /*!< number of resolved addresses in ip_addrs */
 	unsigned short int port; 	/*!< port of the URI */
 	unsigned short int proto; 	/*!< protocol of the URI */
 	int probing_count;
@@ -287,6 +325,7 @@ typedef struct _ds_set {
 	int wlast;			/*!< last used item in dst set (by weight) */
 	int rwlast;			/*!< last used item in dst set (by relative weight) */
 	int pwlast;			/*!< last used item in dst set (by priority+weight) */
+	int plast;			/*!< next item to inspect for pressure tie breaking */
 	ds_dest_t *dlist;
 	unsigned int wlist[100];
 	unsigned int rwlist[100];
@@ -297,6 +336,12 @@ typedef struct _ds_set {
 	gen_lock_t lock;
 } ds_set_t;
 
+typedef struct _ds_list {
+	ds_set_t *head; /*!< top of AVL tree */
+	int nr; /*!< number of sets */
+	unsigned int refs;
+} ds_list_t;
+
 typedef struct _ds_select_state {
 	int setid;  /* dispatcher set id (group id) */
 	int alg;    /* algorithm to select destinations */
@@ -305,12 +350,15 @@ typedef struct _ds_select_state {
 	int cnt;    /* output: number of xavps set with destination addresses */
 	int emode;  /* output: update operation was executed or not */
 	sr_xavp_t *lxavp;
+	send_socket_map_t default_sockmap;
+	int use_sockmap;
 } ds_select_state_t;
 
 struct ds_filter_dest_cb_arg {
 	int setid;
 	ds_dest_t *dest;
-	int *setn;
+	ds_list_t *list;
+	int error;
 };
 
 /* clang-format on */
@@ -320,10 +368,11 @@ struct ds_filter_dest_cb_arg {
 #define AVL_NEITHER -1
 #define AVL_BALANCED(n) (n->longer < 0)
 
-ds_set_t *ds_get_list(void);
+ds_list_t *ds_get_list(void);
+void ds_put_list(ds_list_t *);
 int ds_get_list_nr(void);
 
-ds_set_t *ds_list_lookup(int set);
+ds_set_t *ds_list_lookup(ds_list_t *list, int set);
 
 int ds_ping_active_init(void);
 int ds_ping_active_get(void);

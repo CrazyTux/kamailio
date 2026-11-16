@@ -258,12 +258,6 @@ int pv_get_ruri(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 	if(msg->first_line.type == SIP_REPLY) /* REPLY doesn't have a ruri */
 		return pv_get_null(msg, param, res);
 
-	if(msg->parsed_uri_ok == 0 /* R-URI not parsed*/
-			&& parse_sip_msg_uri(msg) < 0) {
-		LM_ERR("failed to parse the R-URI\n");
-		return pv_get_null(msg, param, res);
-	}
-
 	if(msg->new_uri.s != NULL)
 		return pv_get_strval(msg, param, res, &msg->new_uri);
 	return pv_get_strval(msg, param, res, &msg->first_line.u.request.uri);
@@ -290,13 +284,18 @@ int pv_get_ouri(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 	if(msg->first_line.type == SIP_REPLY) /* REPLY doesn't have a ruri */
 		return pv_get_null(msg, param, res);
 
-	if(msg->parsed_orig_ruri_ok == 0
-			/* orig R-URI not parsed*/
-			&& parse_orig_ruri(msg) < 0) {
-		LM_ERR("failed to parse the R-URI\n");
-		return pv_get_null(msg, param, res);
-	}
 	return pv_get_strval(msg, param, res, &msg->first_line.u.request.uri);
+}
+
+int pv_get_ouri_len(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
+{
+	if(msg == NULL || res == NULL)
+		return -1;
+
+	if(msg->first_line.type == SIP_REPLY) /* REPLY doesn't have a ruri */
+		return pv_get_null(msg, param, res);
+
+	return pv_get_sintval(msg, param, res, msg->first_line.u.request.uri.len);
 }
 
 int pv_get_xuri_attr(struct sip_msg *msg, struct sip_uri *parsed_uri,
@@ -404,7 +403,9 @@ int pv_get_contact_uri(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 	if(msg == NULL)
 		return -1;
 
-	if(msg->contact == NULL && parse_headers(msg, HDR_CONTACT_F, 0) == -1) {
+	if(msg->contact == NULL
+			&& ((parse_headers(msg, HDR_CONTACT_F, 0) == -1)
+					|| (msg->contact == NULL))) {
 		LM_DBG("no contact header\n");
 		return pv_get_null(msg, param, res);
 	}
@@ -427,7 +428,9 @@ int pv_get_contact_star(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 	if(msg == NULL)
 		return -1;
 
-	if(msg->contact == NULL && parse_headers(msg, HDR_CONTACT_F, 0) == -1) {
+	if(msg->contact == NULL
+			&& ((parse_headers(msg, HDR_CONTACT_F, 0) == -1)
+					|| (msg->contact == NULL))) {
 		LM_DBG("no contact header\n");
 		return pv_get_null(msg, param, res);
 	}
@@ -3093,7 +3096,7 @@ int pv_get_tcpconn_id(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 		return pv_get_null(msg, param, res);
 
 	conid = con->id;
-	tcpconn_put(con);
+	tcpconn_chld_put(con);
 
 	return pv_get_sintval(msg, param, res, conid);
 }
@@ -3708,7 +3711,7 @@ int pv_set_xto_attr(struct sip_msg *msg, pv_param_t *param, int op,
 			}
 
 			buf.len = val->rs.len;
-			if(!(tb->style & TBS_URI_ENCLOSED)) {
+			if(val->rs.len > 0 && !(tb->style & TBS_URI_ENCLOSED)) {
 				/* existing uri not enclosed - check if new one has parameters */
 				for(p = val->rs.s + val->rs.len - 1; p > val->rs.s; p--) {
 					if(*p == ';') {

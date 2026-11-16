@@ -420,6 +420,74 @@ modparam("dmq", "fail_count_threshold_disabled", 105)
 		</programlisting>
 		</example>
 	</section>
+	<section id="dmq.p.init_with_single">
+		<title><varname>init_with_single</varname>(int)</title>
+		<para>
+			A non-zero value enables init and sync with single DMQ node (first pinged or answered) instead of all nodes in a node list.
+		</para>
+		<para>
+		<emphasis>Default value is <quote>0</quote> (init and sync with all nodes in a node list).</emphasis>
+		</para>
+		<example>
+		<title>Set <varname>init_with_single</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("dmq", "init_with_single", 1)
+...
+		</programlisting>
+		</example>
+	</section>
+	<section id="dmq.p.event_callback">
+		<title><varname>event_callback</varname> (str)</title>
+		<para>
+			The name of the function in the kemi configuration file (embedded
+			scripting language such as Lua, Python, &hellip;) to be executed instead
+			of event_route[...] blocks.
+		</para>
+		<para>
+			The function receives a string parameter with the name of the event,
+			the values are: <literal>dmq:peer-down</literal>,
+			<literal>dmq:peer-up</literal>, <literal>dmq:peer-disabled</literal>.
+		</para>
+		<para>
+		<emphasis>
+			Default value is empty (no function is executed for events).
+		</emphasis>
+		</para>
+		<example>
+		<title>Set <varname>event_callback</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("dmq", "event_callback", "ksr_dmq_event")
+...
+-- event callback function implemented in Lua
+function ksr_dmq_event(evname)
+	KSR.info("===== dmq module triggered event: " .. evname .. "\n");
+	return 1;
+end
+...
+</programlisting>
+		</example>
+	</section>
+	<section id="dmq.p.sl_send">
+		<title><varname>sl_send</varname>(int)</title>
+		<para>
+			A non-zero value enables stateless message sending.
+			This can be really useful when using TCP as a transport for SIP between nodes.
+			Only messages with a custom reply callback (such as "notification_peer" messages) will be sent statefully.
+		</para>
+		<para>
+		<emphasis>Default value is <quote>0</quote> (disabled).</emphasis>
+		</para>
+		<example>
+		<title>Set <varname>sl_send</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("dmq", "sl_send", 1)
+...
+		</programlisting>
+		</example>
+	</section>
 	</section>
 
 	<section>
@@ -637,7 +705,164 @@ modparam("dmq", "fail_count_threshold_disabled", 105)
                 </programlisting>
                 </example>
         </section>
+        <section id="dmq.f.dmq_process_custom">
+                <title>
+                <function moreinfo="none">dmq_process_custom(peer, node, body, content_type)</function>
+                </title>
+                <para>
+				Immediately process a custom DMQ message by passing it to the appropriate
+				local peer (module).
+                </para>
+                <para>Meaning of parameters:</para>
+                <itemizedlist>
+                        <listitem>
+                                <para>
+                                <emphasis>peer</emphasis> - name of the local peer (module) that should handle the message.
+                                </para>
+                        </listitem>
+                        <listitem>
+                                <para>
+                                <emphasis>node</emphasis> - SIP URI of sender node.
+                                </para>
+                        </listitem>
+                        <listitem>
+                                <para>
+                                <emphasis>body</emphasis> - the message body.
+                                </para>
+                        </listitem>
+                        <listitem>
+                                <para>
+                                <emphasis>content_type</emphasis> - the MIME type of the message body.
+                                </para>
+                        </listitem>
+                </itemizedlist>
+                <para>
+                This function can be used from any route.
+                </para>
 
+                <example>
+                <title><function>dmq_process_custom</function> usage</title>
+                <programlisting format="linespecific">
+...
+    dmq_process_custom("peer_id", "sip:192.168.1.101:5060;transport=tcp", "Message body...", "text/plain");
+...
+</programlisting>
+                </example>
+        </section>
+        <section id="dmq.f.dmq_handle_custom">
+                <title>
+                <function moreinfo="none">dmq_handle_custom(peer, node, body, content_type)</function>
+                </title>
+                <para>
+				Similar to dmq_process_custom, but the processing is happening
+				in a DMQ worker process.
+                </para>
+                <para>Meaning of parameters:</para>
+                <itemizedlist>
+                        <listitem>
+                                <para>
+                                <emphasis>peer</emphasis> - name of the local peer (module) that should handle the message.
+                                </para>
+                        </listitem>
+                        <listitem>
+                                <para>
+                                <emphasis>node</emphasis> - SIP URI of sender node.
+                                </para>
+                        </listitem>
+                        <listitem>
+                                <para>
+                                <emphasis>body</emphasis> - the message body.
+                                </para>
+                        </listitem>
+                        <listitem>
+                                <para>
+                                <emphasis>content_type</emphasis> - the MIME type of the message body.
+                                </para>
+                        </listitem>
+                </itemizedlist>
+                <para>
+                This function can be used from any route.
+                </para>
+
+                <example>
+                <title><function>dmq_handle_custom</function> usage</title>
+                <programlisting format="linespecific">
+...
+    dmq_handle_custom("peer_id", "sip:192.168.1.101:5060;transport=tcp", "Message body...", "text/plain");
+...
+</programlisting>
+                </example>
+        </section>
+
+	</section>
+
+	<section id="dmq.ex.event_routes">
+		<title>Event routes</title>
+		<section>
+			<title>
+			<function moreinfo="none">dmq:peer-down</function>
+			</title>
+			<para>
+			When defined, the module calls event_route[dmq:peer-down] when a
+			remote peer (from <varname>notification_address</varname> or the learned
+			list, not <varname>server_address</varname>) transitions from active to
+			not active (but not when it becomes disabled; see
+			<literal>dmq:peer-disabled</literal>).
+			</para>
+			<para>
+			Execution uses <varname>event_callback</varname> when that modparam is
+			set, otherwise event_route blocks.
+			</para>
+			<programlisting format="linespecific">
+...
+event_route[dmq:peer-down] {
+	xlog("L_INFO", "DMQ peer down: $ru\n");
+}
+...
+</programlisting>
+		</section>
+		<section>
+			<title>
+			<function moreinfo="none">dmq:peer-up</function>
+			</title>
+			<para>
+			When defined, the module calls event_route[dmq:peer-up] when such a
+			remote peer becomes active or is added as active (never for this
+			instance's own server entry).
+			</para>
+			<para>
+			Execution uses <varname>event_callback</varname> when that modparam is
+			set, otherwise event_route blocks.
+			</para>
+			<programlisting format="linespecific">
+...
+event_route[dmq:peer-up] {
+	xlog("L_INFO", "DMQ peer up: $ru\n");
+}
+...
+</programlisting>
+		</section>
+		<section>
+			<title>
+			<function moreinfo="none">dmq:peer-disabled</function>
+			</title>
+			<para>
+			When defined, the module calls event_route[dmq:peer-disabled] when a
+			remote peer enters the disabled state (<literal>DMQ_NODE_DISABLED</literal>),
+			for example after fail-count thresholds.
+			</para>
+			<para>
+			Execution uses <varname>event_callback</varname> when that modparam is
+			set, otherwise event_route blocks.
+			</para>
+			<programlisting format="linespecific">
+...
+event_route[dmq:peer-disabled] {
+	xlog("L_INFO", "DMQ peer disabled: $ru\n");
+}
+...
+</programlisting>
+		</section>
 	</section>
 
 	<section>
@@ -652,6 +877,30 @@ modparam("dmq", "fail_count_threshold_disabled", 105)
                 <programlisting format="linespecific">
 ...
 &kamctl; rpc dmq.list_nodes
+...
+                </programlisting>
+                </example>
+        </section>
+        <section id="dmq.r.add">
+            <title>dmq.add</title>
+			<para>
+				Add a DMQ node.
+			</para>
+			<para>Parameters:</para>
+			<itemizedlist>
+					<listitem>
+					<para>
+						<emphasis>address</emphasis> - the SIP address
+						of the DMQ node to add.
+					</para>
+					</listitem>
+			</itemizedlist>
+
+               <example>
+                <title>dmq.add usage</title>
+                <programlisting format="linespecific">
+...
+&kamctl; rpc dmq.add sip:1.2.3.4:5060
 ...
                 </programlisting>
                 </example>
@@ -676,6 +925,30 @@ modparam("dmq", "fail_count_threshold_disabled", 105)
                 <programlisting format="linespecific">
 ...
 &kamctl; rpc dmq.remove sip:1.2.3.4:5060
+...
+                </programlisting>
+                </example>
+        </section>
+        <section id="dmq.r.change_status">
+            <title>dmq.change_status</title>
+			<para>
+				Change the status of a DMQ node.
+			</para>
+			<para>Parameters:</para>
+			<itemizedlist>
+					<listitem>
+					<para>
+						<emphasis>address</emphasis> - the DMQ node address
+						<emphasis>status</emphasis> - active|not_active|disabled
+					</para>
+					</listitem>
+			</itemizedlist>
+
+               <example>
+                <title>dmq.change_status usage</title>
+                <programlisting format="linespecific">
+...
+&kamctl; rpc dmq.change_status sip:1.2.3.4:5060 active
 ...
                 </programlisting>
                 </example>

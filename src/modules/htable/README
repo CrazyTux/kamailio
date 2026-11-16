@@ -57,6 +57,7 @@ Tyler Moore
               3.14. timer_procs (integer)
               3.15. event_callback (str)
               3.16. event_callback_mode (int)
+              3.17. dmq_peer_id (string)
 
         4. Functions
 
@@ -132,29 +133,30 @@ Tyler Moore
    1.17. Set timer_procs parameter
    1.18. Set event_callback parameter
    1.19. Set event_callback_mode parameter
-   1.20. sht_print usage
-   1.21. sht_rm usage
-   1.22. sht_rm_name_re usage
-   1.23. sht_rm_value_re usage
-   1.24. sht_rm_name usage
-   1.25. sht_rm_value usage
-   1.26. sht_setxs usage
-   1.27. sht_setxi usage
-   1.28. sht_reset usage
-   1.29. sht_lock usage
-   1.30. sht_unlock usage
-   1.31. sht_iterator_start usage
-   1.32. sht_iterator_end usage
-   1.33. sht_iterator_next usage
-   1.34. sht_iterator_rm usage
-   1.35. sht_iterator_sets usage
-   1.36. sht_iterator_seti usage
-   1.37. sht_iterator_setex usage
-   1.38. sht_match_name usage
+   1.20. Set dmq_peer_id parameter
+   1.21. sht_print usage
+   1.22. sht_rm usage
+   1.23. sht_rm_name_re usage
+   1.24. sht_rm_value_re usage
+   1.25. sht_rm_name usage
+   1.26. sht_rm_value usage
+   1.27. sht_setxs usage
+   1.28. sht_setxi usage
+   1.29. sht_reset usage
+   1.30. sht_lock usage
+   1.31. sht_unlock usage
+   1.32. sht_iterator_start usage
+   1.33. sht_iterator_end usage
+   1.34. sht_iterator_next usage
+   1.35. sht_iterator_rm usage
+   1.36. sht_iterator_sets usage
+   1.37. sht_iterator_seti usage
+   1.38. sht_iterator_setex usage
    1.39. sht_match_name usage
-   1.40. sht_is_null usage
-   1.41. sht_inc usage
-   1.42. sht_dec usage
+   1.40. sht_match_name usage
+   1.41. sht_is_null usage
+   1.42. sht_inc usage
+   1.43. sht_dec usage
 
 Chapter 1. Admin Guide
 
@@ -185,6 +187,7 @@ Chapter 1. Admin Guide
         3.14. timer_procs (integer)
         3.15. event_callback (str)
         3.16. event_callback_mode (int)
+        3.17. dmq_peer_id (string)
 
    4. Functions
 
@@ -478,12 +481,14 @@ $ kamctl rpc htable.dump htable
    3.14. timer_procs (integer)
    3.15. event_callback (str)
    3.16. event_callback_mode (int)
+   3.17. dmq_peer_id (string)
 
 3.1. htable (str)
 
    The definition of a hash table. The value of the parameter may have the
    following format:
-     * "htname=>size=_number_;autoexpire=_number_;dbtable=_string_"
+     * "htname=>size=_number_;autoexpire=_number_;dbtable=_string_;fpath=_
+       string_"
 
    The parameter can be set multiple times to get more hash tables in same
    configuration file.
@@ -507,7 +512,33 @@ $ kamctl rpc htable.dump htable
        seconds interval, the hash table will be reloaded. You can catch
        the reload on the event_route: htable:reloaded:<htable>.
      * dbtable - name of database to be loaded at startup in hash table.
-       If empty or missing, no data will be loaded.
+       If empty or missing, no data will be loaded. It cannot be used
+       together with fpath.
+     * fpath - path of a file to be loaded into the hash table at startup.
+       It cannot be used together with dbtable. Each non-empty line must
+       have four fields: “key|value-type|value|expire”, where the
+       delimiter can be changed with fdelim. The value type is 0 for a
+       string and 1 for a signed integer. The expire field is an absolute
+       Unix timestamp, or 0 for an entry that does not expire. Entries
+       whose timestamp is already in the past are not loaded. A missing
+       file or malformed line causes module initialization to fail.
+     * ftype - encoding used by a file-backed hash table. The default
+       value 0 stores keys and string values in clear text. Such values
+       cannot contain the configured delimiter, carriage return, or line
+       feed. Value 1 stores keys and string values as unpadded Base64URL;
+       padded Base64URL is also accepted when loading. Integer values are
+       always stored as decimal text.
+     * fdelim - single character used to separate fields in a file-backed
+       hash table. The default value is “|”. With ftype set to 1, the
+       delimiter cannot be part of the Base64URL alphabet or the padding
+       character “=”.
+       For example, the clear-text form can contain:
+customer42|0|active|1790000000
+counter|1|-23|0
+       With ftype=1, the same records are stored with unpadded Base64URL
+       keys and string values:
+Y3VzdG9tZXI0Mg|0|YWN0aXZl|1790000000
+Y291bnRlcg|1|-23|0
      * cols - the column names of the database table. They must be
        enclosed in quotes in order to form a valid SIP parameter value and
        be separated by comma. The first column corresponds to key_name.
@@ -519,10 +550,10 @@ $ kamctl rpc htable.dump htable
        transformation {s.select,...} can be used in configuration file to
        extract a specific column value). When cols attribute is present,
        writing back to database table is disabled.
-     * dbmode - if set to 1, the content of hash table is written to
-       database table when the SIP server is stopped (i.e., ensure
-       persistency over restarts). Default value is 0 (no write back to db
-       table).
+     * dbmode - if set to 1, the content of the hash table is written to
+       its configured database table or file path when the SIP server is
+       stopped (i.e., ensure persistency over restarts). File write-back
+       uses an atomic replacement. Default value is 0 (no write-back).
      * initval - the integer value to be returned instead of $null when a
        requested key is not set.
      * updateexpire - if set to 1 (default), the time until expiration of
@@ -534,6 +565,14 @@ $ kamctl rpc htable.dump htable
        nodes (htable peers). Please note, module parameter “enable_dmq”
        must also be set in order for this to apply (see below). Default is
        0 (no replication).
+       When replication is enabled for a htable, each cell carries a
+       'last_modified' timestamp with millisecond precision, updated on
+       every value change. This is included in SET_CELL and SYNC DMQ
+       payloads. A receiving peer applies an incoming value only if its
+       'last_modified' timestamp is newer than the local cell's one
+       (Last-Write-Wins); otherwise it keeps the local value. All other
+       DMQ actions carry no 'last_modified' timestamp and remain
+       last-arrived-wins.
      * coldelim - the character delimeter to use when packing the htable.
        When set, this parameter changes the column delimeter between
        columns in a multiple column hash table. This can be useful when
@@ -572,6 +611,8 @@ modparam("htable", "htable", "a=>size=4;autoexpire=7200;dbtable=htable_a;")
 modparam("htable", "htable", "b=>size=5;")
 modparam("htable", "htable", "c=>size=4;autoexpire=7200;initval=1;dmqreplicate=1
 ;")
+modparam("htable", "htable", "d=>size=4;autoexpire=7200;fpath=/var/lib/kamailio/
+d.ht;ftype=1;dbmode=1;")
 ...
 
 3.2. db_url (str)
@@ -781,6 +822,19 @@ end
 modparam("htable", "event_callback_mode", 1)
 ...
 
+3.17. dmq_peer_id (string)
+
+   The DMQ peer identifier for htable replication. This allows customizing
+   the peer name used in DMQ communication, which can be useful to avoid
+   compatibility conflicts, and for a better partitioning.
+
+   Default value is “htable”.
+
+   Example 1.20. Set dmq_peer_id parameter
+...
+modparam("htable", "dmq_peer_id", "htable_6.1.1")
+...
+
 4. Functions
 
    4.1. sht_print()
@@ -817,7 +871,7 @@ modparam("htable", "event_callback_mode", 1)
    This function can be used from REQUEST_ROUTE, FAILURE_ROUTE,
    ONREPLY_ROUTE, BRANCH_ROUTE.
 
-   Example 1.20. sht_print usage
+   Example 1.21. sht_print usage
 ...
 sht_print();
 ...
@@ -829,7 +883,7 @@ sht_print();
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.21. sht_rm usage
+   Example 1.22. sht_rm usage
 ...
 sht_rm("ha", "test"");
 ...
@@ -842,7 +896,7 @@ sht_rm("ha", "test"");
    This function can be used from REQUEST_ROUTE, FAILURE_ROUTE,
    ONREPLY_ROUTE, BRANCH_ROUTE.
 
-   Example 1.22. sht_rm_name_re usage
+   Example 1.23. sht_rm_name_re usage
 ...
 sht_rm_name_re("ha=>.*");
 ...
@@ -855,7 +909,7 @@ sht_rm_name_re("ha=>.*");
    This function can be used from REQUEST_ROUTE, FAILURE_ROUTE,
    ONREPLY_ROUTE, BRANCH_ROUTE.
 
-   Example 1.23. sht_rm_value_re usage
+   Example 1.24. sht_rm_value_re usage
 ...
 sht_rm_value_re("ha=>.*");
 ...
@@ -875,7 +929,7 @@ sht_rm_value_re("ha=>.*");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.24. sht_rm_name usage
+   Example 1.25. sht_rm_name usage
 ...
 sht_rm_name("ha", "re", ".*");
 ...
@@ -895,7 +949,7 @@ sht_rm_name("ha", "re", ".*");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.25. sht_rm_value usage
+   Example 1.26. sht_rm_value usage
 ...
 sht_rm_value("ha", "re", ".*");
 ...
@@ -909,7 +963,7 @@ sht_rm_value("ha", "re", ".*");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.26. sht_setxs usage
+   Example 1.27. sht_setxs usage
 ...
 sht_setxs("ha", "test", "abc", "10");
 ...
@@ -923,7 +977,7 @@ sht_setxs("ha", "test", "abc", "10");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.27. sht_setxi usage
+   Example 1.28. sht_setxi usage
 ...
 sht_setxs("ha", "test", "100", "10");
 ...
@@ -935,7 +989,7 @@ sht_setxs("ha", "test", "100", "10");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.28. sht_reset usage
+   Example 1.29. sht_reset usage
 ...
 sht_reset("ha$var(x)");
 ...
@@ -948,7 +1002,7 @@ sht_reset("ha$var(x)");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.29. sht_lock usage
+   Example 1.30. sht_lock usage
 ...
 sht_lock("ha=>test");
 ...
@@ -961,7 +1015,7 @@ sht_lock("ha=>test");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.30. sht_unlock usage
+   Example 1.31. sht_unlock usage
 ...
 sht_lock("ha=>test");
 $sht(ha=>test) = $sht(ha=>test) + 10;
@@ -983,7 +1037,7 @@ sht_unlock("ha=>test");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.31. sht_iterator_start usage
+   Example 1.32. sht_iterator_start usage
 ...
 sht_iterator_start("i1", "h1");
 ...
@@ -998,7 +1052,7 @@ sht_iterator_start("i1", "h1");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.32. sht_iterator_end usage
+   Example 1.33. sht_iterator_end usage
 ...
 sht_iterator_end("i1");
 ...
@@ -1020,7 +1074,7 @@ sht_iterator_end("i1");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.33. sht_iterator_next usage
+   Example 1.34. sht_iterator_next usage
 ...
     sht_iterator_start("i1", "h1");
     while(sht_iterator_next("i1")) {
@@ -1043,7 +1097,7 @@ sht_iterator_end("i1");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.34. sht_iterator_rm usage
+   Example 1.35. sht_iterator_rm usage
 ...
     sht_iterator_start("i1", "h1");
     while(sht_iterator_next("i1")) {
@@ -1062,7 +1116,7 @@ sht_iterator_end("i1");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.35. sht_iterator_sets usage
+   Example 1.36. sht_iterator_sets usage
 ...
     sht_iterator_start("i1", "h1");
     sht_iterator_next("i1");
@@ -1078,7 +1132,7 @@ sht_iterator_end("i1");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.36. sht_iterator_seti usage
+   Example 1.37. sht_iterator_seti usage
 ...
     sht_iterator_start("i1", "h1");
     sht_iterator_next("i1");
@@ -1094,7 +1148,7 @@ sht_iterator_end("i1");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.37. sht_iterator_setex usage
+   Example 1.38. sht_iterator_setex usage
 ...
     sht_iterator_start("i1", "h1");
     sht_iterator_next("i1");
@@ -1117,7 +1171,7 @@ sht_iterator_end("i1");
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.38. sht_match_name usage
+   Example 1.39. sht_match_name usage
 ...
 if(sht_match_name("ha", "eq", "alice")) {
   ...
@@ -1143,7 +1197,7 @@ if(sht_match_name("ha", "eq", "alice")) {
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.39. sht_match_name usage
+   Example 1.40. sht_match_name usage
 ...
 if(sht_match_str_value("ha", "eq", "alice")) {
   ...
@@ -1171,7 +1225,7 @@ if(sht_match_str_value("ha", "eq", "alice")) {
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.40. sht_is_null usage
+   Example 1.41. sht_is_null usage
 ...
 if (sht_is_null("my_ht", "my_key")) {
     xlog("L_ERR", "could not find my_key in my_ht\n");
@@ -1190,7 +1244,7 @@ if (sht_is_null("my_ht", "my_key")) {
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.41. sht_inc usage
+   Example 1.42. sht_inc usage
 ...
 if (!sht_inc("my_ht", "my_key")) {
     xlog("L_ERR", "could not increment my_key\n");
@@ -1209,7 +1263,7 @@ if (!sht_inc("my_ht", "my_key")) {
 
    This function can be used from ANY_ROUTE.
 
-   Example 1.42. sht_dec usage
+   Example 1.43. sht_dec usage
 ...
 if (!sht_dec("my_ht", "my_key")) {
     xlog("L_ERR", "could not decrement my_key\n");

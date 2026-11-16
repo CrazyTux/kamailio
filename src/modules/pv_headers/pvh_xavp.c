@@ -713,7 +713,13 @@ xavp_c_data_t *pvh_set_parsed(
 	return c_data;
 
 err:
-	// how can I call?? pvh_xavi_free_data(c_data, shm_free);
+	if(c_data != NULL) {
+		if(c_data->value.s != NULL) {
+			shm_free(c_data->value.s);
+		}
+		shm_free(c_data);
+		c_data = NULL;
+	}
 	return NULL;
 }
 
@@ -810,26 +816,33 @@ int pvh_set_uri(struct sip_msg *msg, pv_param_t *param, int op, pv_value_t *val)
 	enum action_type a_type;
 	char t[pvh_hdr_name_size];
 	str hname = {t, pvh_hdr_name_size - 1};
-	str fval;
+	str fval = STR_NULL;
 
 	p_no = param->pvn.u.isname.name.n;
-	if(p_no >= 1 && p_no <= 5)
-		pvh_str_copy(&hname, &pvh_hdr_from, pvh_hdr_name_size);
-	else if(p_no >= 6 && p_no <= 10)
-		pvh_str_copy(&hname, &pvh_hdr_to, pvh_hdr_name_size);
-
 	switch(p_no) {
 		case 1: // uri from
 		case 6: // uri to
 			a_type = SET_URI_T;
+			if(!val) {
+				LM_ERR("uri can't be unset\n");
+				goto err;
+			}
 			break;
 		case 2: // username from
 		case 7: // username to
 			a_type = SET_USER_T;
+			if(!val) {
+				LM_ERR("user can't be unset\n");
+				goto err;
+			}
 			break;
 		case 3: // domain from
 		case 8: // domain to
 			a_type = SET_HOST_T;
+			if(!val) {
+				LM_ERR("host can't be unset\n");
+				goto err;
+			}
 			break;
 		case 4: // displayname from
 		case 9: // displayname to
@@ -840,19 +853,25 @@ int pvh_set_uri(struct sip_msg *msg, pv_param_t *param, int op, pv_value_t *val)
 			goto err;
 	}
 
-	if(val->flags & (PV_TYPE_INT | PV_VAL_INT)) {
-		if(pv_get_sintval(msg, param, val, val->ri) < 0)
+	if(p_no >= 1 && p_no <= 5)
+		pvh_str_copy(&hname, &pvh_hdr_from, pvh_hdr_name_size);
+	else if(p_no >= 6 && p_no <= 10)
+		pvh_str_copy(&hname, &pvh_hdr_to, pvh_hdr_name_size);
+
+	if(val) {
+		if(val->flags & (PV_TYPE_INT | PV_VAL_INT)) {
+			if(pv_get_sintval(msg, param, val, val->ri) < 0)
+				goto err;
+		}
+
+		if(pv_parse_format(&val->rs, &pv_format) < 0) {
+			LM_ERR("cannot parse format: %.*s\n", val->rs.len, val->rs.s);
 			goto err;
-	}
-
-	if(pv_parse_format(&val->rs, &pv_format) < 0) {
-		LM_ERR("cannot parse format: %.*s\n", val->rs.len, val->rs.s);
-		goto err;
-	}
-
-	if(pv_printf_s(msg, pv_format, &fval) < 0) {
-		LM_ERR("cannot parse format: %.*s\n", val->rs.len, val->rs.s);
-		goto err;
+		}
+		if(pv_printf_s(msg, pv_format, &fval) < 0) {
+			LM_ERR("cannot parse format: %.*s\n", val->rs.len, val->rs.s);
+			goto err;
+		}
 	}
 
 	xval = pvh_xavi_get_value(msg, &_pvh_params.xavi_name, &hname, 0);
@@ -886,6 +905,13 @@ int pvh_set_uri(struct sip_msg *msg, pv_param_t *param, int op, pv_value_t *val)
 err:
 	if(pv_format)
 		pv_elem_free_all(pv_format);
+	if(c_data != NULL) {
+		if(c_data->value.s != NULL) {
+			shm_free(c_data->value.s);
+		}
+		shm_free(c_data);
+		c_data = NULL;
+	}
 	return -1;
 }
 
@@ -902,8 +928,10 @@ int pvh_merge_uri(struct sip_msg *msg, enum action_type type, str *cur,
 	struct to_param **sparam = NULL;
 	str *merged = NULL;
 	char *c_ptr = NULL;
-	str uri_t;
-	int os = 0;
+	unsigned int max_hdr = _pvh_params.hdr_value_size;
+	str uri_t = STR_NULL, str_t = STR_NULL;
+	str space = {" ", 1}, lt = {"<", 1}, gt = {">", 1}, eq = {"=", 1};
+	str colon = {":", 1}, semicolon = {";", 1};
 	int t_len = 0;
 
 	parse_addr_spec(cur->s, cur->s + cur->len, &tb, 0);
@@ -918,90 +946,120 @@ int pvh_merge_uri(struct sip_msg *msg, enum action_type type, str *cur,
 	}
 	puri = tb.parsed_uri;
 
-	c_data->value.s = (char *)shm_malloc(_pvh_params.hdr_value_size);
+	c_data->value.s = (char *)shm_malloc(max_hdr);
 	if(c_data->value.s == NULL) {
 		SHM_MEM_ERROR;
 		goto err;
 	}
 	merged = &c_data->value;
+	merged->len = 0;
 
 	if(type == SET_URI_T && strchr(new->s, '<')) {
-		pvh_str_copy(merged, new, _pvh_params.hdr_value_size);
+		pvh_str_copy(merged, new, max_hdr);
 		goto reparse;
 	}
 
-	os = 0;
 	if(type == SET_USERPHONE_T) {
-		memcpy(merged->s + os, new->s, new->len);
-		os += new->len;
-		memcpy(merged->s + os, " ", 1);
-		os += 1;
+		if(new->len > 0) {
+			if(pvh_str_append(merged, new, max_hdr) < 0) {
+				LM_ERR("new value[%d] exceeds header_value_size\n", new->len);
+				goto err;
+			}
+			if(pvh_str_append(merged, &space, max_hdr) < 0) {
+				goto err;
+			}
+		}
 	} else if(tb.display.len > 0) {
-		memcpy(merged->s + os, tb.display.s, tb.display.len);
-		os += tb.display.len;
-		memcpy(merged->s + os, " ", 1);
-		os += 1;
+		if(pvh_str_append(merged, &tb.display, max_hdr) < 0) {
+			goto err;
+		}
+		if(pvh_str_append(merged, &space, max_hdr) < 0) {
+			goto err;
+		}
 	}
-	memcpy(merged->s + os, "<", 1);
-	os += 1;
+	if(pvh_str_append(merged, &lt, max_hdr) < 0) {
+		goto err;
+	}
 	if(type != SET_URI_T) {
 		uri_type_to_str(puri.type, &uri_t);
 		t_len = uri_t.len + 1;
-		memcpy(merged->s + os, uri_t.s, uri_t.len);
-		os += uri_t.len;
-		memcpy(merged->s + os, ":", 1);
-		os += 1;
+		if(pvh_str_append(merged, &uri_t, max_hdr) < 0) {
+			goto err;
+		}
+		if(pvh_str_append(merged, &colon, max_hdr) < 0) {
+			goto err;
+		}
 	}
 	switch(type) {
 		case SET_USERPHONE_T:
-			memcpy(merged->s + os, tb.uri.s + t_len, tb.uri.len - t_len);
-			os += tb.uri.len - t_len;
+			str_t.s = tb.uri.s + t_len;
+			str_t.len = tb.uri.len - t_len;
+			if(pvh_str_append(merged, &str_t, max_hdr) < 0) {
+				goto err;
+			}
 			break;
 		case SET_URI_T:
-			memcpy(merged->s + os, new->s, new->len);
-			os += new->len;
+			if(pvh_str_append(merged, new, max_hdr) == -2) {
+				LM_ERR("new uri[%d] exceeds header_value_size\n", new->len);
+				goto err;
+			}
 			break;
 		case SET_USER_T:
-			memcpy(merged->s + os, new->s, new->len);
-			os += new->len;
-			memcpy(merged->s + os, tb.uri.s + t_len + puri.user.len,
-					tb.uri.len - t_len - puri.user.len);
-			os += tb.uri.len - t_len - puri.user.len;
+			if(pvh_str_append(merged, new, max_hdr) < 0) {
+				LM_ERR("new user[%d] exceeds header_value_size\n", new->len);
+				goto err;
+			}
+			str_t.s = tb.uri.s + t_len + puri.user.len;
+			str_t.len = tb.uri.len - t_len - puri.user.len;
+			if(pvh_str_append(merged, &str_t, max_hdr) < 0) {
+				goto err;
+			}
 			break;
 		case SET_HOST_T:
 			if((c_ptr = strchr(tb.uri.s, '@')) == NULL) {
 				LM_ERR("invalid uri: %.*s\n", tb.uri.len, tb.uri.s);
 				goto err;
 			}
-			memcpy(merged->s + os, tb.uri.s + t_len,
-					c_ptr - tb.uri.s - t_len + 1);
-			os += c_ptr - tb.uri.s - t_len + 1;
-			memcpy(merged->s + os, new->s, new->len);
-			os += new->len;
-			memcpy(merged->s + os, c_ptr + puri.host.len + 1,
-					tb.uri.s + tb.uri.len - c_ptr - puri.host.len - 1);
-			os += tb.uri.s + tb.uri.len - c_ptr - puri.host.len - 1;
+			str_t.s = tb.uri.s + t_len;
+			str_t.len = c_ptr - tb.uri.s - t_len + 1;
+			if(pvh_str_append(merged, &str_t, max_hdr) < 0) {
+				goto err;
+			}
+			if(pvh_str_append(merged, new, max_hdr) < 0) {
+				LM_ERR("new host[%d] exceeds header_value_size\n", new->len);
+				goto err;
+			}
+			str_t.s = c_ptr + puri.host.len + 1;
+			str_t.len = tb.uri.s + tb.uri.len - c_ptr - puri.host.len - 1;
+			if(pvh_str_append(merged, &str_t, max_hdr) < 0) {
+				LM_ERR("new host[%d] exceeds header_value_size\n", new->len);
+				goto err;
+			}
 			break;
 		default:
 			LM_ERR("unknown set uri op\n");
 			goto err;
 	}
-	memcpy(merged->s + os, ">", 1);
-	os += 1;
+	if(pvh_str_append(merged, &gt, max_hdr) < 0) {
+		goto err;
+	}
 	if((param = tb.param_lst) != NULL) {
 		while(param) {
-			memcpy(merged->s + os, ";", 1);
-			os += 1;
-			memcpy(merged->s + os, param->name.s, param->name.len);
-			os += param->name.len;
-			memcpy(merged->s + os, "=", 1);
-			os += 1;
-			memcpy(merged->s + os, param->value.s, param->value.len);
-			os += param->value.len;
+			if(pvh_str_append(merged, &semicolon, max_hdr) < 0) {
+				goto err;
+			}
+			if(pvh_str_append(merged, &param->name, max_hdr) < 0) {
+				goto err;
+			}
+			if(pvh_str_append(merged, &eq, max_hdr) < 0) {
+				goto err;
+			}
+			if(pvh_str_append(merged, &param->value, max_hdr) < 0) {
+				goto err;
+			}
 			param = param->next;
 		}
 	}
-	merged->len = os;
 	merged->s[merged->len] = '\0';
 
 reparse:

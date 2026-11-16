@@ -670,7 +670,7 @@ static int fix_nated_contact(struct sip_msg *msg)
 	str params1 = {0};
 	str params2 = {0};
 
-	if(get_contact_uri(msg, &uri, &c) == -1)
+	if(get_contact_uri(msg, &uri, &c) < 0)
 		return -1;
 	if((c->uri.s < msg->buf) || (c->uri.s > (msg->buf + msg->len))) {
 		LM_ERR("you can't call fix_nated_contact twice, "
@@ -771,7 +771,7 @@ static int set_contact_alias(struct sip_msg *msg, int trim)
 	nuri.len = MAX_URI_SIZE;
 	curi.s = cbuf;
 	curi.len = MAX_URI_SIZE;
-	if(get_contact_uri(msg, &uri, &c) == -1)
+	if(get_contact_uri(msg, &uri, &c) < 0)
 		return -1;
 	if((c->uri.s < msg->buf) || (c->uri.s > (msg->buf + msg->len))) {
 		LM_ERR("you can't update contact twice, check your config!\n");
@@ -866,19 +866,14 @@ static int add_contact_alias_0(struct sip_msg *msg)
 	struct sip_uri uri;
 	struct ip_addr *ip;
 	char *bracket, *lt, *param, *at, *port, *start;
+	int rc = 0;
 
-	/* Do nothing if Contact header does not exist */
-	if(!msg->contact) {
-		if(parse_headers(msg, HDR_CONTACT_F, 0) == -1) {
-			LM_ERR("while parsing headers\n");
-			return -1;
-		}
-		if(!msg->contact) {
-			LM_DBG("no contact header\n");
+	if((rc = get_contact_uri(msg, &uri, &c)) < 0) {
+		if(rc < -1) {
+			/* do nothing if Contact header or URI does not exist */
+			LM_DBG("star or no contact header\n");
 			return 2;
 		}
-	}
-	if(get_contact_uri(msg, &uri, &c) == -1) {
 		LM_ERR("failed to get contact uri\n");
 		return -1;
 	}
@@ -1021,32 +1016,26 @@ static int proto_type_to_int(char *proto)
 static int add_contact_alias_3(
 		sip_msg_t *msg, str *ip_str, str *port_str, str *proto_str)
 {
-	int param_len, proto;
+	int len, param_len, proto, ip_len;
 	unsigned int tmp;
 	contact_t *c;
 	struct lump *anchor;
 	struct sip_uri uri;
-	char *bracket, *lt, *param, *at, *start;
-	int is_ipv6 = 0;
-	int i;
+	struct ip_addr *ip;
+	char *bracket, *lt, *param, *at, *port, *start;
+	int rc = 0;
 
-	/* Do nothing if Contact header does not exist */
-	if(!msg->contact) {
-		if(parse_headers(msg, HDR_CONTACT_F, 0) == -1) {
-			LM_ERR("while parsing headers\n");
-			return -1;
-		}
-		if(!msg->contact) {
-			LM_DBG("no contact header\n");
+	if((rc = get_contact_uri(msg, &uri, &c)) < 0) {
+		if(rc < -1) {
+			/* do nothing if Contact header or URI does not exist */
+			LM_DBG("star or no contact header\n");
 			return 2;
 		}
-	}
-	if(get_contact_uri(msg, &uri, &c) == -1) {
 		LM_ERR("failed to get contact uri\n");
 		return -1;
 	}
 
-	if((str2ip(ip_str) == NULL) && (str2ip6(ip_str) == NULL)) {
+	if(((ip = str2ip(ip_str)) == NULL) && ((ip = str2ip6(ip_str)) == NULL)) {
 		LM_ERR("ip param value %s is not valid IP address\n", ip_str->s);
 		return -1;
 	}
@@ -1098,24 +1087,24 @@ static int add_contact_alias_3(
 		goto err;
 	}
 	at = param;
-	/* ip address */
-	for(i = 0; i < ip_str->len; i++) {
-		if(ip_str->s[i] == ':') {
-			is_ipv6 = 1;
-			break;
-		}
-	}
-	if(is_ipv6 && ip_str->s[0] != '[') {
+	append_str(at, _ksr_contact_salias.s, _ksr_contact_salias.len);
+	/* Serialize the parsed values so their lengths match the allocation. */
+	if(ip->af == AF_INET6) {
 		append_chr(at, '[');
 	}
-	append_str(at, _ksr_contact_salias.s, _ksr_contact_salias.len);
-	append_str(at, ip_str->s, ip_str->len);
-	if(is_ipv6 && ip_str->s[0] != '[') {
+	ip_len = ip_addr2sbuf(ip, at, param_len - (at - param));
+	if(ip_len <= 0) {
+		LM_ERR("failed to copy ip address\n");
+		goto err;
+	}
+	at += ip_len;
+	if(ip->af == AF_INET6) {
 		append_chr(at, ']');
 	}
 	/* port */
 	append_chr(at, '~');
-	append_str(at, port_str->s, port_str->len);
+	port = int2str(tmp, &len);
+	append_str(at, port, len);
 	/* proto */
 	append_chr(at, '~');
 	append_chr(at, proto + '0');
@@ -1185,6 +1174,11 @@ static int ki_handle_ruri_alias_mode(struct sip_msg *msg, int mode)
 			ip_len, ip_port_len, port_len, i;
 	int is_ipv6 = 0;
 
+	if(msg->first_line.u.request.uri.len > MAX_URI_SIZE - 1
+			|| msg->new_uri.len > MAX_URI_SIZE - 1) {
+		LM_ERR("very long Request-URI\n");
+		return -1;
+	}
 	if(parse_sip_msg_uri(msg) < 0) {
 		LM_ERR("while parsing Request-URI\n");
 		return -1;
@@ -1274,7 +1268,8 @@ static int ki_handle_ruri_alias_mode(struct sip_msg *msg, int mode)
 		at = at + ip_port_len;
 	}
 	trans = trans + 1;
-	if((ip_port_len + 2 > val_len) || (*trans == ';') || (*trans == '?')) {
+	if((ip_port_len + 2 > val_len) || (trans >= val + val_len)
+			|| (*trans == ';') || (*trans == '?')) {
 		LM_ERR("no proto in alias param\n");
 		return -1;
 	}
@@ -1497,7 +1492,7 @@ static int contact_1918(struct sip_msg *msg)
 	struct sip_uri uri;
 	contact_t *c;
 
-	if(get_contact_uri(msg, &uri, &c) == -1)
+	if(get_contact_uri(msg, &uri, &c) < 0)
 		return -1;
 
 	return (is1918addr(&(uri.host)) == 1) ? 1 : 0;
@@ -1512,7 +1507,7 @@ static int contact_rport(struct sip_msg *msg)
 	struct sip_uri uri;
 	contact_t *c;
 
-	if(get_contact_uri(msg, &uri, &c) == -1) {
+	if(get_contact_uri(msg, &uri, &c) < 0) {
 		return -1;
 	}
 
@@ -2297,6 +2292,7 @@ static void nh_timer(unsigned int ticks, void *timer_idx)
 	static unsigned int iteration = 0;
 	int rval;
 	void *buf, *cp;
+	char *buf_end;
 	str c;
 	str recv;
 	str *dst_uri;
@@ -2363,25 +2359,78 @@ static void nh_timer(unsigned int ticks, void *timer_idx)
 		goto done;
 
 	cp = buf;
+	buf_end = (char *)buf + cblen;
 	while(1) {
+		if((char *)cp + sizeof(c.len) > buf_end) {
+			LM_ERR("truncated natping contact blob while reading contact "
+				   "length\n");
+			goto error;
+		}
 		memcpy(&(c.len), cp, sizeof(c.len));
 		if(c.len == 0)
 			break;
-		c.s = (char *)cp + sizeof(c.len);
-		cp = (char *)cp + sizeof(c.len) + c.len;
+		cp = (char *)cp + sizeof(c.len);
+		if(c.len < 0 || (char *)cp + c.len > buf_end) {
+			LM_ERR("invalid natping contact length: %d\n", c.len);
+			goto error;
+		}
+		c.s = (char *)cp;
+		cp = (char *)cp + c.len;
+		if((char *)cp + sizeof(recv.len) > buf_end) {
+			LM_ERR("truncated natping contact blob while reading received "
+				   "length\n");
+			goto error;
+		}
 		memcpy(&(recv.len), cp, sizeof(recv.len));
-		recv.s = (char *)cp + sizeof(recv.len);
-		cp = (char *)cp + sizeof(recv.len) + recv.len;
+		cp = (char *)cp + sizeof(recv.len);
+		if(recv.len < 0 || (char *)cp + recv.len > buf_end) {
+			LM_ERR("invalid natping received length: %d\n", recv.len);
+			goto error;
+		}
+		recv.s = recv.len ? (char *)cp : NULL;
+		cp = (char *)cp + recv.len;
+		if((char *)cp + sizeof(send_sock) > buf_end) {
+			LM_ERR("truncated natping contact blob while reading socket\n");
+			goto error;
+		}
 		memcpy(&send_sock, cp, sizeof(send_sock));
 		cp = (char *)cp + sizeof(send_sock);
+		if((char *)cp + sizeof(flags) > buf_end) {
+			LM_ERR("truncated natping contact blob while reading flags\n");
+			goto error;
+		}
 		memcpy(&flags, cp, sizeof(flags));
 		cp = (char *)cp + sizeof(flags);
+		if((char *)cp + sizeof(path.len) > buf_end) {
+			LM_ERR("truncated natping contact blob while reading path "
+				   "length\n");
+			goto error;
+		}
 		memcpy(&(path.len), cp, sizeof(path.len));
-		path.s = path.len ? ((char *)cp + sizeof(path.len)) : NULL;
-		cp = (char *)cp + sizeof(path.len) + path.len;
+		cp = (char *)cp + sizeof(path.len);
+		if(path.len < 0 || (char *)cp + path.len > buf_end) {
+			LM_ERR("invalid natping path length: %d\n", path.len);
+			goto error;
+		}
+		path.s = path.len ? (char *)cp : NULL;
+		cp = (char *)cp + path.len;
+		if((char *)cp + sizeof(ruid.len) > buf_end) {
+			LM_ERR("truncated natping contact blob while reading ruid "
+				   "length\n");
+			goto error;
+		}
 		memcpy(&(ruid.len), cp, sizeof(ruid.len));
-		ruid.s = ruid.len ? ((char *)cp + sizeof(ruid.len)) : NULL;
-		cp = (char *)cp + sizeof(ruid.len) + ruid.len;
+		cp = (char *)cp + sizeof(ruid.len);
+		if(ruid.len < 0 || (char *)cp + ruid.len > buf_end) {
+			LM_ERR("invalid natping ruid length: %d\n", ruid.len);
+			goto error;
+		}
+		ruid.s = ruid.len ? (char *)cp : NULL;
+		cp = (char *)cp + ruid.len;
+		if((char *)cp + sizeof(aorhash) > buf_end) {
+			LM_ERR("truncated natping contact blob while reading aorhash\n");
+			goto error;
+		}
 		memcpy(&aorhash, cp, sizeof(aorhash));
 		cp = (char *)cp + sizeof(aorhash);
 
@@ -2480,11 +2529,15 @@ static void nh_timer(unsigned int ticks, void *timer_idx)
 			}
 		}
 	}
+
+error:
 	pkg_free(buf);
+
 done:
 	iteration++;
 	if(iteration == natping_interval)
 		iteration = 0;
+	return;
 }
 
 
@@ -2916,6 +2969,7 @@ static int nh_alias_to_uri(str *contact_header, str *alias_uri)
 	str port = {0, 0};
 	str proto = {0, 0};
 	char *memchr_pointer = NULL;
+	unsigned int proto_type = 0;
 
 	if(!contact_header)
 		return -1;
@@ -2964,7 +3018,22 @@ static int nh_alias_to_uri(str *contact_header, str *alias_uri)
 	}
 	//last char is proto 0,1,2,3,4..7
 	proto.s = &port.s[port.len + 1];
-	proto_type_to_str((unsigned short)atoi(proto.s), &proto);
+	if(proto.s >= contact_header->s + contact_header->len
+			|| !isdigit((unsigned char)*proto.s)) {
+		LM_ERR("alias proto is not set or invalid\n");
+		return -1;
+	}
+	proto_type = (unsigned int)(*proto.s - '0');
+	if(proto.s + 1 < contact_header->s + contact_header->len
+			&& isdigit((unsigned char)proto.s[1])) {
+		LM_ERR("alias proto has invalid length\n");
+		return -1;
+	}
+	proto_type_to_str((unsigned short)proto_type, &proto);
+	if(proto.len == 0) {
+		LM_ERR("alias proto is unknown\n");
+		return -1;
+	}
 
 	LM_DBG("Host [%.*s][port: %.*s][proto: %.*s]\n", host.len, host.s, port.len,
 			port.s, proto.len, proto.s);

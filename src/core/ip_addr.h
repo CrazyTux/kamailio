@@ -175,6 +175,57 @@ typedef struct socket_info
 #endif		   /* USE_MCAST */
 } socket_info_t;
 
+typedef struct send_socket_map
+{
+	socket_info_t *udp;
+	socket_info_t *tcp;
+	socket_info_t *tls;
+	socket_info_t *sctp;
+} send_socket_map_t;
+
+static inline socket_info_t *send_socket_map_get(
+		const send_socket_map_t *smap, unsigned short proto)
+{
+	if(smap == NULL) {
+		return NULL;
+	}
+	switch(proto) {
+		case PROTO_UDP:
+			return smap->udp;
+		case PROTO_TCP:
+		case PROTO_WS:
+			return smap->tcp;
+		case PROTO_TLS:
+		case PROTO_WSS:
+			return smap->tls;
+		case PROTO_SCTP:
+			return smap->sctp;
+		default:
+			return NULL;
+	}
+}
+
+static inline void corex_send_socket_map_set(
+		send_socket_map_t *smap, int proto, socket_info_t *si)
+{
+	switch(proto) {
+		case PROTO_UDP:
+			smap->udp = si;
+			break;
+		case PROTO_TCP:
+		case PROTO_WS:
+			smap->tcp = si;
+			break;
+		case PROTO_TLS:
+		case PROTO_WSS:
+			smap->tls = si;
+			break;
+		case PROTO_SCTP:
+			smap->sctp = si;
+			break;
+	}
+}
+
 typedef struct socket_attrs
 {
 	int bindproto;
@@ -197,6 +248,8 @@ typedef enum send_flags
 	SND_F_FORCE_CON_REUSE = (1 << 0), /* reuse an existing connection or fail */
 	SND_F_CON_CLOSE = (1 << 1),		  /* close the connection after sending */
 	SND_F_FORCE_SOCKET = (1 << 2),	  /* send socket in dst is forced */
+	SND_F_FORCE_PROTO = (1 << 3),	  /* reuse connections of same proto */
+	SND_F_WSX_OUTBOUND = (1 << 4),	  /* allow no ws/wss open connection */
 } send_flags_t;
 
 typedef struct snd_flags
@@ -235,7 +288,8 @@ typedef struct receive_info
 	/* no need for dst_su yet */
 } receive_info_t;
 
-typedef struct ksr_sockaddr {
+typedef struct ksr_sockaddr
+{
 	ip_addr_t ip;
 	unsigned short port;
 	char proto;
@@ -269,6 +323,7 @@ typedef struct sr_net_info
 } sr_net_info_t;
 
 sr_net_info_t *ksr_evrt_rcvnetinfo_get(void);
+void ksr_evrt_rcvnetinfo_set(sr_net_info_t *netinfo);
 
 #define SND_FLAGS_INIT(sflags)    \
 	do {                          \

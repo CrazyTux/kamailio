@@ -6,6 +6,11 @@ DIST=bullseye
 rm -rf ${DIST}
 cp -r debian ${DIST}
 
+# default-libmysqlclient-dev
+sed -i -e 's/libmariadb-dev-compat/default-libmysqlclient-dev/' \
+  -e 's/mariadb-client/default-mysql-client/' \
+  ${DIST}/control
+
 # cmake missing PostgreSQL_TYPE_INCLUDE_DIR
 sed -i '/^ libpq-dev,/a\ postgresql-server-dev-all,' ${DIST}/control
 
@@ -15,6 +20,7 @@ sed -i -e '/^ libnats-dev,/d' \
   ${DIST}/control
 sed -i -e '/^PACKAGE_GROUPS += nats/d' ${DIST}/rules
 sed -i -e '/--EXCLUDED--/i EXTRA_EXCLUDED_MODULES += nats' ${DIST}/rules
+rm -rf ${DIST}/kamailio-nats-modules.cmake-components
 
 # libwolfssl-dev < 5.2
 sed -i -e '/^ libwolfssl-dev,/d' \
@@ -24,7 +30,8 @@ sed -i -e '/^PACKAGE_GROUPS += tls_wolfssl/d' ${DIST}/rules
 sed -i -e '/--EXCLUDED--/i EXTRA_EXCLUDED_MODULES += tls_wolfssl' ${DIST}/rules
 
 # libjwt < 1.12
-sed -i -e '/libjwt-dev/d' -e 's/, JWT (JSON Web Token)//' ${DIST}/control
+sed -i -e '/libjwt-dev/d' -e 's/, JWT (JSON Web Token)//' \
+  -e 's/ jwt//' ${DIST}/control
 sed -i -e '/^EXTRA_GROUPS += jwt$/d' ${DIST}/rules
 sed -i -e '/KJWT/d' ${DIST}/kamailio-extra-modules.cmake-components
 
@@ -34,6 +41,7 @@ sed -i -e '/^ libsecp256k1-dev,/d' \
   ${DIST}/control
 sed -i -e '/^PACKAGE_GROUPS += auth_blockchain$/d' ${DIST}/rules
 sed -i -e '/--EXCLUDED--/i EXTRA_EXCLUDED_MODULES += auth_blockchain' ${DIST}/rules
+rm -rf ${DIST}/kamailio-authblockchain-modules.cmake-components
 
 # latest higher lua version available
 sed -i -e 's/liblua5.5-dev/liblua5.4-dev/g' ${DIST}/control

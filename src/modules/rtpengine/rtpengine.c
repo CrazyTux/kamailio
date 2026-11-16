@@ -37,7 +37,6 @@
 #include <netinet/udp.h>
 #include <arpa/inet.h>
 #include <sys/uio.h>
-#include <sys/un.h>
 #include <ctype.h>
 #include <errno.h>
 #include <netdb.h>
@@ -96,13 +95,6 @@
 #include "api.h"
 
 MODULE_VERSION
-
-#if !defined(AF_LOCAL)
-#define AF_LOCAL AF_UNIX
-#endif
-#if !defined(PF_LOCAL)
-#define PF_LOCAL PF_UNIX
-#endif
 
 /* NAT UAC test constants */
 #define NAT_UAC_TEST_C_1918 0x01
@@ -241,6 +233,7 @@ static void rtpengine_ping_check_timer(unsigned int ticks, void *);
 static int w_rtpengine_query_v(sip_msg_t *msg, char *pfmt, char *pvar);
 static int fixup_rtpengine_query_v(void **param, int param_no);
 static int fixup_free_rtpengine_query_v(void **param, int param_no);
+static int rtpengine_query_v_print(bencode_item_t *dict, str *fmt, str *bout);
 
 static int rtpengine_subscribe_request_wrap_f(struct sip_msg *msg, char *str1,
 		char *str2, char *str3, char *str4, char *str5);
@@ -373,6 +366,9 @@ static pv_spec_t *read_sdp_pvar = NULL;
 static str media_duration_pvar_str = {NULL, 0};
 static pv_spec_t *media_duration_pvar = NULL;
 
+static str stats_reply_pvar_str = {NULL, 0};
+static pv_spec_t *stats_reply_pvar = NULL;
+
 static str dtmf_event_callid_pvar_str = {NULL, 0};
 static pv_spec_t *dtmf_event_callid_pvar = NULL;
 
@@ -426,6 +422,7 @@ int dtmf_event_rt = -1; /* default disabled */
 static int rtpengine_ping_mode = 1;
 static int rtpengine_ping_interval = 60;
 static int rtpengine_enable_dmq = 0;
+str rtpengine_dmq_peer_id = str_init("rtpengine");
 
 /* clang-format off */
 typedef struct rtpp_set_link {
@@ -588,6 +585,7 @@ static param_export_t params[] = {
 	{"hash_table_size", PARAM_INT, &hash_table_size},
 	{"setid_default", PARAM_INT, &setid_default},
 	{"media_duration", PARAM_STR, &media_duration_pvar_str},
+	{"stats_reply_pv", PARAM_STR, &stats_reply_pvar_str},
 	{"hash_algo", PARAM_INT, &hash_algo},
 	{"dtmf_events_sock", PARAM_STRING | PARAM_USE_FUNC,
 			(void *)rtpengine_set_dtmf_events_sock},
@@ -700,6 +698,7 @@ static param_export_t params[] = {
 			&side_B_mos_stats.average.samples_param},
 
 	{"wsapi", PARAM_STR, &_rtpe_wsapi},
+	{"dmq_peer_id", PARAM_STR, &rtpengine_dmq_peer_id},
 
 	{0, 0, 0}
 };
@@ -1218,6 +1217,7 @@ int get_rtpp_set_id_by_node(struct rtpp_node *node)
 {
 	struct rtpp_set *rtpp_list;
 	struct rtpp_node *crt_rtpp;
+	unsigned int res = 0;
 
 	lock_get(rtpp_set_list->rset_head_lock);
 	for(rtpp_list = rtpp_set_list->rset_first; rtpp_list != NULL;
@@ -1232,15 +1232,14 @@ int get_rtpp_set_id_by_node(struct rtpp_node *node)
 			}
 		}
 		lock_release(rtpp_list->rset_lock);
-		if(crt_rtpp != NULL)
+		if(crt_rtpp != NULL) {
+			res = rtpp_list->id_set;
 			break;
+		}
 	}
 	lock_release(rtpp_set_list->rset_head_lock);
 
-	if(crt_rtpp != NULL)
-		return rtpp_list->id_set;
-	else
-		return 0;
+	return res;
 }
 
 /**
@@ -1334,16 +1333,13 @@ int add_rtpengine_socks(struct rtpp_set *rtpp_list, char *rtpengine,
 		} else if(strncasecmp(pnode->rn_address, "udp6:", 5) == 0) {
 			pnode->rn_umode = RNU_UDP6;
 			pnode->rn_address += 5;
-		} else if(strncasecmp(pnode->rn_address, "unix:", 5) == 0) {
-			pnode->rn_umode = RNU_LOCAL;
-			pnode->rn_address += 5;
 		} else if(strncasecmp(pnode->rn_address, "ws://", 5) == 0) {
 			pnode->rn_umode = RNU_WS;
 		} else if(strncasecmp(pnode->rn_address, "wss://", 6) == 0) {
 			pnode->rn_umode = RNU_WSS;
 		} else {
 			lock_release(rtpp_no_lock);
-			LM_WARN("Node address must start with 'udp:' or 'udp6:' or 'unix:' "
+			LM_WARN("Node address must start with 'udp:' or 'udp6:' "
 					"or 'ws://' or 'wss://'. Ignore '%s'.\n",
 					pnode->rn_address);
 			shm_free(pnode->rn_url.s);
@@ -2588,6 +2584,18 @@ static int mod_init(void)
 		}
 	}
 
+	if(stats_reply_pvar_str.len > 0) {
+		stats_reply_pvar = pv_cache_get(&stats_reply_pvar_str);
+		if(stats_reply_pvar == NULL
+				|| (stats_reply_pvar->type != PVT_AVP
+						&& stats_reply_pvar->type != PVT_SCRIPTVAR)) {
+			LM_ERR("stats_reply_pv: not a valid AVP or VAR definition "
+				   "<%.*s>\n",
+					stats_reply_pvar_str.len, stats_reply_pvar_str.s);
+			return -1;
+		}
+	}
+
 	if(rtpp_strings)
 		pkg_free(rtpp_strings);
 
@@ -2858,11 +2866,13 @@ static int build_rtpp_socks(int lmode, int rtest)
 
 		rtpe_reload_lock_get(rtpp_list->rset_lock);
 		for(pnode = rtpp_list->rn_first; pnode != 0; pnode = pnode->rn_next) {
+			if(!pnode->rn_displayed) {
+				continue;
+			}
 			char *hostname;
 			char *hp;
 
-			if(pnode->rn_umode == RNU_LOCAL || pnode->rn_umode == RNU_WS
-					|| pnode->rn_umode == RNU_WSS) {
+			if(pnode->rn_umode == RNU_WS || pnode->rn_umode == RNU_WSS) {
 				rtpp_socks[pnode->idx] = -1;
 				goto rptest;
 			}
@@ -3103,11 +3113,15 @@ static int child_init(int rank)
 	/* Iterate known RTPEngine instances - create sockets */
 	if(rank == PROC_SIPINIT) {
 		/* probe rtpengines only in first worker */
-		if(build_rtpp_socks(0, rtpengine_ping_mode))
+		if(build_rtpp_socks(0, 0))
 			return -1;
 		else {
 			if(build_rtpp_socks(0, 0))
 				return -1;
+		}
+		if(rtpengine_ping_mode) {
+			/* test the rtpengine with ping */
+			rtpengine_ping_check_timer(0, NULL);
 		}
 	}
 
@@ -3317,7 +3331,7 @@ static int parse_from_to_tags(struct ng_flags_parse *ng_flags,
 static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 		enum rtpe_operation *op, const char *flags_str)
 {
-	char *e;
+	char *e, v;
 	const char *err;
 	str key, val, s, s1;
 	int ip_af = AF_UNSPEC;
@@ -3355,7 +3369,9 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 			goto next;
 		}
 		if(str_key_val_prefix(&key, "received-from", &val, &s)) {
+			STR_VTOZ(s.s[s.len], v);
 			ip_af = get_ip_type(s.s);
+			STR_ZTOV(s.s[s.len], v);
 			if(ip_af == AF_INET) {
 				s1.s = "IP4";
 				s1.len = 3;
@@ -3983,7 +3999,7 @@ select_node:
 					viabranch.s);
 			if(rtpengine_enable_dmq > 0)
 				rtpengine_dmq_replicate_insert(
-						ng_flags.call_id, viabranch, entry);
+						ng_flags.call_id, viabranch, node);
 		}
 	}
 
@@ -4071,6 +4087,243 @@ static bencode_item_t *rtpp_function_call_ok(bencode_buffer_t *bencbuf,
 }
 
 /**
+ * @brief Context for tracking parallel UDP ping state per node.
+ */
+struct rtpe_ping_ctx
+{
+	char cookie[COOKIE_SIZE]; /* unique cookie for this ping */
+	int cookie_len;			  /* length of cookie (including trailing space) */
+	int node_idx;			  /* index into nodes[] array */
+	int responded;			  /* 0=pending, 1=pong_ok, -1=failed */
+	char msg[COOKIE_SIZE + 20]; /* cookie + "d7:command4:pinge" */
+	int msg_len;
+};
+
+/**
+ * @brief Ping multiple UDP rtpengine nodes in parallel using poll().
+ *
+ * @details Instead of pinging nodes sequentially (which can take N * timeout
+ * seconds for N dead nodes), this function sends all pings first, then uses
+ * a single poll() call to wait for responses from all nodes simultaneously.
+ * Retries are only sent to nodes that haven't responded yet.
+ *
+ * @param nodes Local copy of rtpp_node array (safe to modify without locks).
+ * @param total_nodes Total number of entries in the nodes array.
+ */
+static void rtpengine_ping_nodes_udp_parallel(
+		struct rtpp_node *nodes, int total_nodes)
+{
+	struct rtpe_ping_ctx *ctx = NULL;
+	struct pollfd *fds = NULL;
+	char recv_buf[0x10000]; /* 64KB - pong replies are small */
+	char *ck;
+	int udp_count = 0;
+	int idx, j, n, len, pending;
+	int rtpengine_retr, rtpengine_tout_ms;
+	struct timeval tv_start, tv_now;
+	long elapsed_ms, time_left_ms;
+
+	/* Count pingable UDP nodes */
+	for(idx = 0; idx < total_nodes; idx++) {
+		if(!nodes[idx].rn_displayed)
+			continue;
+		if(nodes[idx].rn_disabled
+				&& nodes[idx].rn_recheck_ticks == RTPENGINE_MAX_RECHECK_TICKS)
+			continue;
+		if(nodes[idx].rn_umode != RNU_UDP && nodes[idx].rn_umode != RNU_UDP6)
+			continue;
+		udp_count++;
+	}
+
+	if(udp_count == 0)
+		return;
+
+	/* Allocate parallel tracking arrays */
+	fds = (struct pollfd *)pkg_malloc(sizeof(struct pollfd) * udp_count);
+	ctx = (struct rtpe_ping_ctx *)pkg_malloc(
+			sizeof(struct rtpe_ping_ctx) * udp_count);
+	if(!fds || !ctx) {
+		LM_ERR("not enough pkg memory for parallel ping (%d nodes)\n",
+				udp_count);
+		if(fds)
+			pkg_free(fds);
+		if(ctx)
+			pkg_free(ctx);
+		return;
+	}
+	memset(fds, 0, sizeof(struct pollfd) * udp_count);
+	memset(ctx, 0, sizeof(struct rtpe_ping_ctx) * udp_count);
+
+	/* BUILD phase: bencode dict + cookie + drain (once per node) */
+	j = 0;
+	for(idx = 0; idx < total_nodes; idx++) {
+		if(!nodes[idx].rn_displayed)
+			continue;
+		if(nodes[idx].rn_disabled
+				&& nodes[idx].rn_recheck_ticks == RTPENGINE_MAX_RECHECK_TICKS)
+			continue;
+		if(nodes[idx].rn_umode != RNU_UDP && nodes[idx].rn_umode != RNU_UDP6)
+			continue;
+
+		ctx[j].node_idx = idx;
+		ctx[j].responded = 0;
+
+		/* Build ping message: cookie (with trailing space) + fixed bencode body */
+		ck = gencookie();
+		ctx[j].cookie_len = strlen(ck);
+		memcpy(ctx[j].cookie, ck, ctx[j].cookie_len + 1);
+		memcpy(ctx[j].msg, ctx[j].cookie, ctx[j].cookie_len);
+		memcpy(ctx[j].msg + ctx[j].cookie_len, "d7:command4:pinge", 17);
+		ctx[j].msg_len = ctx[j].cookie_len + 17;
+
+		/* Setup pollfd */
+		fds[j].fd = rtpp_socks[nodes[idx].idx];
+		fds[j].events = POLLIN;
+		fds[j].revents = 0;
+
+		/* Drain stale data from socket (once) */
+		while((poll(&fds[j], 1, 0) == 1) && (fds[j].revents & POLLIN)) {
+			recv(fds[j].fd, recv_buf, sizeof(recv_buf), 0);
+			fds[j].revents = 0;
+		}
+
+		j++;
+	}
+
+	/* Get retry/timeout config */
+	rtpengine_retr = cfg_get(rtpengine, rtpengine_cfg, rtpengine_retr);
+	rtpengine_tout_ms = cfg_get(rtpengine, rtpengine_cfg, rtpengine_tout_ms);
+
+	/* Count initial pending (exclude build failures) */
+	pending = 0;
+	for(j = 0; j < udp_count; j++) {
+		if(ctx[j].responded == 0)
+			pending++;
+	}
+
+	/* RETRY LOOP */
+	for(n = 0; n < rtpengine_retr && pending > 0; n++) {
+
+		/* SEND phase: send ping to all pending nodes */
+		for(j = 0; j < udp_count; j++) {
+			if(ctx[j].responded != 0)
+				continue;
+
+			do {
+				len = send(fds[j].fd, ctx[j].msg, ctx[j].msg_len, 0);
+			} while(len == -1 && (errno == EINTR || errno == ENOBUFS));
+
+			if(len <= 0) {
+				LM_ERR("can't send ping to RTPEngine <%s> (%s:%d)\n",
+						nodes[ctx[j].node_idx].rn_url.s, strerror(errno),
+						errno);
+				ctx[j].responded = -1;
+				fds[j].fd = -1;
+				pending--;
+			}
+		}
+
+		if(pending <= 0)
+			break;
+
+		/* RECV phase: poll all pending sockets with timeout */
+		gettimeofday(&tv_start, NULL);
+
+		while(pending > 0) {
+			/* Compute remaining time for this retry round */
+			gettimeofday(&tv_now, NULL);
+			elapsed_ms = (tv_now.tv_sec - tv_start.tv_sec) * 1000
+						 + (tv_now.tv_usec - tv_start.tv_usec) / 1000;
+			time_left_ms = rtpengine_tout_ms - elapsed_ms;
+			if(time_left_ms <= 0)
+				break;
+
+			len = poll(fds, udp_count, (int)time_left_ms);
+			if(len <= 0)
+				break; /* timeout or error */
+
+			/* Process all ready sockets */
+			for(j = 0; j < udp_count; j++) {
+				if(!(fds[j].revents & POLLIN))
+					continue;
+
+				do {
+					len = recv(fds[j].fd, recv_buf, sizeof(recv_buf) - 1, 0);
+				} while(len == -1 && errno == EINTR);
+
+				if(len <= 0) {
+					LM_ERR("recv error from RTPEngine <%s> (%s:%d)\n",
+							nodes[ctx[j].node_idx].rn_url.s, strerror(errno),
+							errno);
+					ctx[j].responded = -1;
+					fds[j].fd = -1;
+					pending--;
+					continue;
+				}
+
+				/* Match cookie (len-1 to exclude trailing space) */
+				if(len >= (ctx[j].cookie_len - 1)
+						&& memcmp(recv_buf, ctx[j].cookie,
+								   ctx[j].cookie_len - 1)
+								   == 0) {
+					/* Cookie matched - strip cookie + space */
+					bencode_buffer_t bencbuf;
+					bencode_item_t *resp_dict;
+					char *cp = recv_buf + (ctx[j].cookie_len - 1);
+					len -= (ctx[j].cookie_len - 1);
+					if(len > 0) {
+						len--;
+						cp++;
+					}
+					cp[len] = '\0';
+
+					if(!bencode_buffer_init(&bencbuf)) {
+						resp_dict = bencode_decode_expect(
+								&bencbuf, cp, len, BENCODE_DICTIONARY);
+						if(resp_dict
+								&& !bencode_dictionary_get_strcmp(
+										resp_dict, "result", "pong")) {
+							ctx[j].responded = 1; /* pong received */
+						} else {
+							ctx[j].responded = -1; /* bad response */
+						}
+						bencode_buffer_free(&bencbuf);
+					} else {
+						ctx[j].responded = -1; /* bencode init failed */
+					}
+					fds[j].fd = -1;
+					pending--;
+				} else {
+					/* Stale reply, wrong cookie - ignore, keep waiting */
+					fds[j].revents = 0;
+				}
+			}
+		}
+	}
+
+	/* APPLY RESULTS to nodes[] array */
+	for(j = 0; j < udp_count; j++) {
+		idx = ctx[j].node_idx;
+		if(ctx[j].responded == 1) {
+			/* Ping success - enable node (unless manually disabled) */
+			if(nodes[idx].rn_recheck_ticks != RTPENGINE_MAX_RECHECK_TICKS) {
+				nodes[idx].rn_disabled = 0;
+				nodes[idx].rn_recheck_ticks = RTPENGINE_MIN_RECHECK_TICKS;
+			}
+		} else {
+			/* Ping failed - disable node with timeout for recheck */
+			nodes[idx].rn_disabled = 1;
+			nodes[idx].rn_recheck_ticks =
+					get_ticks()
+					+ cfg_get(rtpengine, rtpengine_cfg, rtpengine_disable_tout);
+		}
+	}
+
+	pkg_free(fds);
+	pkg_free(ctx);
+}
+
+/**
 * @brief Timer function to check the status of rtpengine nodes.
 * Check every node in the set and if it is not responding,
 * mark it as disabled.
@@ -4136,19 +4389,21 @@ static void rtpengine_ping_check_timer(unsigned int ticks, void *param)
 	}
 	lock_release(rtpp_set_list->rset_head_lock);
 
-	/* Ping the nodes, no locks */
-	LM_DBG("Ping nodes...\n");
+	/* Ping UDP nodes in parallel, no locks */
+	rtpengine_ping_nodes_udp_parallel(nodes, total_nodes);
+
+	/* Ping non-UDP nodes sequentially (LOCAL/WS/WSS), no locks */
 	for(idx = 0; idx < total_nodes; idx++) {
-		/* Skip not needed node */
 		if(!nodes[idx].rn_displayed
 				|| (nodes[idx].rn_disabled
 						&& nodes[idx].rn_recheck_ticks
 								   == RTPENGINE_MAX_RECHECK_TICKS)) {
 			continue;
 		}
-
-		/* Ping node */
-		LM_DBG("Ping node %s\n", nodes[idx].rn_url.s);
+		/* Skip UDP nodes - already handled above */
+		if(nodes[idx].rn_umode == RNU_UDP || nodes[idx].rn_umode == RNU_UDP6) {
+			continue;
+		}
 		crt_rtpp = &nodes[idx];
 		rtpengine_iter_cb_ping(crt_rtpp, rtpp_list, &rtpp_disabled);
 	}
@@ -4280,10 +4535,32 @@ error:
 	return 1;
 }
 
+static int rtpengine_poll_ms(struct pollfd *fds, nfds_t nfds, int timeout_ms)
+{
+	struct timeval tv_start, tv_now;
+	long elapsed_ms;
+	int time_left_ms = timeout_ms;
+	int ret;
+
+	gettimeofday(&tv_start, NULL);
+	for(;;) {
+		ret = poll(fds, nfds, time_left_ms);
+		if(ret != -1 || errno != EINTR)
+			return ret;
+		gettimeofday(&tv_now, NULL);
+		elapsed_ms = (tv_now.tv_sec - tv_start.tv_sec) * 1000
+					 + (tv_now.tv_usec - tv_start.tv_usec) / 1000;
+		time_left_ms = timeout_ms - (int)elapsed_ms;
+		if(time_left_ms < 0)
+			time_left_ms = 0;
+		else if(time_left_ms > timeout_ms)
+			time_left_ms = timeout_ms;
+	}
+}
+
 static char *send_rtpp_command(
 		struct rtpp_node *node, bencode_item_t *dict, int *outlen)
 {
-	struct sockaddr_un addr;
 	int fd = -1, len, i, vcnt;
 	int rtpengine_retr, rtpengine_tout_ms = 1000;
 	char *cp;
@@ -4304,43 +4581,7 @@ static char *send_rtpp_command(
 	cp = buf;
 	rtpengine_tout_ms = cfg_get(rtpengine, rtpengine_cfg, rtpengine_tout_ms);
 
-	if(node->rn_umode == RNU_LOCAL) {
-		memset(&addr, 0, sizeof(addr));
-		addr.sun_family = AF_LOCAL;
-		strncpy(addr.sun_path, node->rn_address, sizeof(addr.sun_path) - 1);
-#ifdef HAVE_SOCKADDR_SA_LEN
-		addr.sun_len = strlen(addr.sun_path);
-#endif
-
-		fd = socket(AF_LOCAL, SOCK_STREAM, 0);
-		if(fd < 0) {
-			LM_ERR("can't create socket\n");
-			goto badproxy;
-		}
-		if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-			LM_ERR("can't connect to RTPEngine <%s> (%s:%d)\n", node->rn_url.s,
-					strerror(errno), errno);
-			goto badproxy;
-		}
-
-		do {
-			len = writev(fd, v + 1, vcnt);
-		} while(len == -1 && errno == EINTR);
-		if(len <= 0) {
-			LM_ERR("can't send command to RTPEngine <%s> (%s:%d)\n",
-					node->rn_url.s, strerror(errno), errno);
-			goto badproxy;
-		}
-		do {
-			len = read(fd, buf, sizeof(buf) - 1);
-		} while(len == -1 && errno == EINTR);
-		if(len <= 0) {
-			LM_ERR("can't read reply from RTPEngine <%s> (%s:%d)\n",
-					node->rn_url.s, strerror(errno), errno);
-			goto badproxy;
-		}
-		close(fd);
-	} else if(node->rn_umode == RNU_WS || node->rn_umode == RNU_WSS) {
+	if(node->rn_umode == RNU_WS || node->rn_umode == RNU_WSS) {
 		/* assemble full request string, flatten iovec */
 		v[0].iov_base = gencookie();
 		v[0].iov_len = strlen(v[0].iov_base);
@@ -4413,7 +4654,7 @@ static char *send_rtpp_command(
 						cmd.len, cmd.s, node->rn_url.s, strerror(errno), errno);
 				goto badproxy;
 			}
-			while((poll(fds, 1, rtpengine_tout_ms) == 1)
+			while((rtpengine_poll_ms(fds, 1, rtpengine_tout_ms) == 1)
 					&& (fds[0].revents & POLLIN) != 0) {
 				do {
 					len = recv(rtpp_socks[node->idx], buf, sizeof(buf) - 1, 0);
@@ -4873,150 +5114,171 @@ static int decode_mos_vals_dict(
 	return 1;
 }
 
+static int parse_call_stats_ssrc(bencode_item_t *ssrc_dict,
+		struct minmax_stats_vals *min_vals, struct minmax_stats_vals *max_vals,
+		struct minmax_stats_vals *average_vals)
+{
+	int ok = 0;
+	struct minmax_stats_vals vals_decoded;
+
+	if(decode_mos_vals_dict(&vals_decoded, ssrc_dict, "average MOS")) {
+		if(vals_decoded.mos > 0) {
+			average_vals->avg_samples++;
+			average_vals->mos += vals_decoded.mos;
+			average_vals->packetloss += vals_decoded.packetloss;
+			average_vals->jitter += vals_decoded.jitter;
+			average_vals->roundtrip += vals_decoded.roundtrip;
+			average_vals->roundtrip_leg += vals_decoded.roundtrip_leg;
+			average_vals->samples += vals_decoded.samples;
+		}
+		ok = 1;
+	}
+
+	if(decode_mos_vals_dict(&vals_decoded, ssrc_dict, "highest MOS")) {
+		if(vals_decoded.mos > max_vals->mos)
+			*max_vals = vals_decoded;
+		ok = 1;
+	}
+	if(decode_mos_vals_dict(&vals_decoded, ssrc_dict, "lowest MOS")) {
+		if(vals_decoded.mos > 0 && vals_decoded.mos < min_vals->mos)
+			*min_vals = vals_decoded;
+		ok = 1;
+	}
+
+	return ok;
+}
+
+static void parse_call_stats_glob(unsigned long long ssrc,
+		bencode_item_t *ssrc_list, struct minmax_stats_vals *min_vals,
+		struct minmax_stats_vals *max_vals,
+		struct minmax_stats_vals *average_vals)
+{
+	char ssrc_str[32];
+	bencode_item_t *ssrc_dict;
+
+	snprintf(ssrc_str, sizeof(ssrc_str), "%llu", ssrc);
+	ssrc_dict = bencode_dictionary_get_expect(
+			ssrc_list, ssrc_str, BENCODE_DICTIONARY);
+	if(!ssrc_dict)
+		return;
+	LM_DBG("rtpengine stats: found SSRC stats");
+
+	if(parse_call_stats_ssrc(ssrc_dict, min_vals, max_vals, average_vals))
+		LM_DBG("rtpengine stats: consumed");
+}
+
 static void parse_call_stats_1(struct minmax_mos_label_stats *mmls,
 		bencode_item_t *dict, struct sip_msg *msg)
 {
 	long long created;
 	str label, check;
-	long long ssrcs[4];
-	unsigned int num_ssrcs = 0, i;
 	long long ssrc;
-	char *endp;
-	bencode_item_t *ssrc_list, *ssrc_key, *ssrc_dict, *tags, *tag_key,
-			*tag_dict, *medias, *media, *streams, *stream, *ingress_ssrcs,
-			*ingress_ssrc;
+	bencode_item_t *ssrc_list, *tags, *tag_key, *tag_dict, *medias, *media,
+			*streams, *stream, *ingress_ssrcs, *ingress_ssrc;
 	struct minmax_stats_vals min_vals = {.mos = 100}, max_vals = {.mos = -1},
-							 average_vals = {.avg_samples = 0}, vals_decoded;
+							 average_vals = {.avg_samples = 0};
 
 	if(!mmls->got_any_pvs)
 		return;
 
 	/* check if only a subset of info is requested */
-	if(!mmls->label_pv)
-		goto ssrcs_done;
-
-	if(pv_printf_s(msg, mmls->label_pv, &label)) {
-		LM_ERR("error printing label PV\n");
-		return;
+	if(mmls->label_pv) {
+		if(pv_printf_s(msg, mmls->label_pv, &label)) {
+			LM_ERR("error printing label PV\n");
+			return;
+		}
+		LM_DBG("rtpengine stats: looking for label '%.*s'\n", label.len,
+				label.s);
 	}
-	LM_DBG("rtpengine: looking for label '%.*s'\n", label.len, label.s);
+
+	ssrc_list = bencode_dictionary_get_expect(dict, "SSRC", BENCODE_DICTIONARY);
+	created = bencode_dictionary_get_integer(dict, "created", 0);
 
 	/* walk through tags to find the label we're looking for */
 	tags = bencode_dictionary_get_expect(dict, "tags", BENCODE_DICTIONARY);
 	if(!tags)
-		return; /* label wanted but no tags found - return nothing */
-	LM_DBG("rtpengine: XXX got tags\n");
+		return; /* no tags found - return nothing */
+	LM_DBG("rtpengine stats: got tags\n");
 
 	for(tag_key = tags->child; tag_key; tag_key = tag_key->sibling->sibling) {
-		LM_DBG("rtpengine: XXX got tag\n");
 		tag_dict = tag_key->sibling;
-		/* compare label */
-		if(!bencode_dictionary_get_str(tag_dict, "label", &check))
-			continue;
-		LM_DBG("rtpengine: XXX got label %.*s\n", check.len, check.s);
-		if(str_strcmp(&check, &label))
-			continue;
-		LM_DBG("rtpengine: XXX label match\n");
+
+		if(mmls->label_pv) {
+			/* compare label */
+			if(!bencode_dictionary_get_str(tag_dict, "label", &check))
+				continue;
+			LM_DBG("rtpengine stats: got label %.*s\n", check.len, check.s);
+			if(str_strcmp(&check, &label))
+				continue;
+			LM_DBG("rtpengine stats: label match\n");
+		}
+
 		medias =
 				bencode_dictionary_get_expect(tag_dict, "medias", BENCODE_LIST);
 		if(!medias)
 			continue;
-		LM_DBG("rtpengine: XXX got medias\n");
+		LM_DBG("rtpengine stats: got medias\n");
+
 		for(media = medias->child; media; media = media->sibling) {
-			LM_DBG("rtpengine: XXX got media\n");
+			LM_DBG("rtpengine stats: got media\n");
+
 			streams = bencode_dictionary_get_expect(
 					media, "streams", BENCODE_LIST);
 			if(!streams)
 				continue;
-			LM_DBG("rtpengine: XXX got streams\n");
+
+			LM_DBG("rtpengine stats: got streams\n");
 			/* only check the first stream (RTP) */
 			stream = streams->child;
 			if(!stream)
 				continue;
-			LM_DBG("rtpengine: XXX got stream type %i\n", stream->type);
-			LM_DBG("rtpengine: XXX stream child '%.*s'\n",
-					(int)stream->child->iov[1].iov_len,
-					(char *)stream->child->iov[1].iov_base);
-			LM_DBG("rtpengine: XXX stream child val type %i\n",
-					stream->child->sibling->type);
-			ssrc = bencode_dictionary_get_integer(stream, "SSRC", -1);
-			if(ssrc == -1) {
+
+			LM_DBG("rtpengine stats: got stream type %i\n", stream->type);
+			LM_DBG("rtpengine stats: stream child '%.*s'\n",
+					stream->child ? (int)stream->child->iov[1].iov_len : 0,
+					stream->child ? (char *)stream->child->iov[1].iov_base
+								  : "");
+			LM_DBG("rtpengine stats: stream child val type %i\n",
+					stream->child && stream->child->sibling
+							? stream->child->sibling->type
+							: -1);
+
+			ingress_ssrcs = bencode_dictionary_get_expect(
+					media, "ingress SSRCs", BENCODE_LIST);
+
+			if(!ingress_ssrcs)
 				ingress_ssrcs = bencode_dictionary_get_expect(
 						stream, "ingress SSRCs", BENCODE_LIST);
-				if(!ingress_ssrcs || !ingress_ssrcs->child)
-					continue;
-				LM_DBG("rtpengine: XXX got ingress SSRCs\n");
-				ingress_ssrc = ingress_ssrcs->child;
-				if((ssrc = bencode_dictionary_get_integer(
-							ingress_ssrc, "SSRC", -1))
-						== -1) {
-					continue;
+
+			if(ingress_ssrcs) {
+				/* we have a full list of SSRCs */
+				LM_DBG("rtpengine stats: got ingress SSRCs\n");
+				for(ingress_ssrc = ingress_ssrcs->child; ingress_ssrc;
+						ingress_ssrc = ingress_ssrc->sibling) {
+					if((ssrc = bencode_dictionary_get_integer(
+								ingress_ssrc, "SSRC", -1))
+							== -1)
+						continue;
+					LM_DBG("rtpengine stats: found ingress SSRC '%lli'\n",
+							ssrc);
+
+					/* use directly if it's a full dict, otherwise look up
+					 * in global list */
+					if(parse_call_stats_ssrc(ingress_ssrc, &min_vals, &max_vals,
+							   &average_vals))
+						LM_DBG("rtpengine stats: consumed");
+					else
+						parse_call_stats_glob(ssrc, ssrc_list, &min_vals,
+								&max_vals, &average_vals);
 				}
+			} else {
+				ssrc = bencode_dictionary_get_integer(stream, "SSRC", -1);
+				if(ssrc == -1)
+					continue;
+				LM_DBG("rtpengine stats: found single SSRC '%lli'\n", ssrc);
+				parse_call_stats_glob(
+						ssrc, ssrc_list, &min_vals, &max_vals, &average_vals);
 			}
-
-			/* got a valid SSRC to watch for */
-			ssrcs[num_ssrcs] = ssrc;
-			LM_DBG("rtpengine: found SSRC '%lli' for label '%.*s'\n", ssrc,
-					label.len, label.s);
-			num_ssrcs++;
-			/* see if we can do more */
-			if(num_ssrcs >= (sizeof(ssrcs) / sizeof(*ssrcs)))
-				goto ssrcs_done;
-		}
-	}
-	/* if we get here, we were looking for label. see if we found one. if not, return nothing */
-	if(num_ssrcs == 0)
-		return;
-
-ssrcs_done:
-	/* now look for the stats values */
-	created = bencode_dictionary_get_integer(dict, "created", 0);
-	ssrc_list = bencode_dictionary_get_expect(dict, "SSRC", BENCODE_DICTIONARY);
-	if(!ssrc_list)
-		return;
-
-	for(ssrc_key = ssrc_list->child; ssrc_key;
-			ssrc_key = ssrc_key->sibling->sibling) {
-		/* see if this is a SSRC we're interested in */
-		if(num_ssrcs == 0)
-			goto ssrc_ok;
-		if(!bencode_get_str(ssrc_key, &check))
-			continue;
-		ssrc = strtoll(check.s, &endp, 10);
-		for(i = 0; i < num_ssrcs; i++) {
-			if(ssrcs[i] != ssrc)
-				continue;
-			/* it's a match */
-			LM_DBG("rtpengine: considering SSRC '%.*s'\n", check.len, check.s);
-			goto ssrc_ok;
-		}
-		/* no match */
-		continue;
-
-	ssrc_ok:
-		ssrc_dict = ssrc_key->sibling;
-		if(!ssrc_dict)
-			continue;
-
-		if(decode_mos_vals_dict(&vals_decoded, ssrc_dict, "average MOS")) {
-			if(vals_decoded.mos > 0) {
-				average_vals.avg_samples++;
-				average_vals.mos += vals_decoded.mos;
-				average_vals.packetloss += vals_decoded.packetloss;
-				average_vals.jitter += vals_decoded.jitter;
-				average_vals.roundtrip += vals_decoded.roundtrip;
-				average_vals.roundtrip_leg += vals_decoded.roundtrip_leg;
-				average_vals.samples += vals_decoded.samples;
-			}
-		}
-
-		if(decode_mos_vals_dict(&vals_decoded, ssrc_dict, "highest MOS")) {
-			if(vals_decoded.mos > max_vals.mos)
-				max_vals = vals_decoded;
-		}
-		if(decode_mos_vals_dict(&vals_decoded, ssrc_dict, "lowest MOS")) {
-			if(vals_decoded.mos > 0 && vals_decoded.mos < min_vals.mos)
-				min_vals = vals_decoded;
 		}
 	}
 
@@ -5025,8 +5287,34 @@ ssrcs_done:
 	avp_print_mos(&mmls->average, &average_vals, created, msg);
 }
 
+/* store the entire command reply, serialized as JSON, in the
+ * pseudovariable configured via the stats_reply_pv modparam */
+static void stats_reply_store(struct sip_msg *msg, bencode_item_t *dict)
+{
+	static str jfmt = str_init("j");
+	pv_value_t val = {0};
+
+	if(stats_reply_pvar == NULL)
+		return;
+
+	if(rtpengine_query_v_print(dict, &jfmt, &val.rs) < 0) {
+		LM_ERR("failed to serialize command reply\n");
+		return;
+	}
+
+	val.flags = PV_VAL_STR;
+	if(stats_reply_pvar->setf(msg, &stats_reply_pvar->pvp, (int)EQ_T, &val) < 0)
+		LM_ERR("failed to set stats_reply_pv <%.*s>\n",
+				stats_reply_pvar_str.len, stats_reply_pvar_str.s);
+
+	/* val.rs.s is allocated by srjson print */
+	free(val.rs.s);
+}
+
 static void parse_call_stats(bencode_item_t *dict, struct sip_msg *msg)
 {
+	stats_reply_store(msg, dict);
+
 	if(!got_any_mos_pvs)
 		return;
 

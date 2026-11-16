@@ -48,7 +48,7 @@ void sr_core_ert_init(void)
 	/* 0 - is not a valid index in event_route blocks list */
 	_sr_core_ert_list.init_parse_error =
 			route_get(&event_rt, "core:receive-parse-error");
-	if(_sr_core_ert_list.init_parse_error <= 0
+	if(_sr_core_ert_list.init_parse_error < 0
 			|| event_rt.rlist[_sr_core_ert_list.init_parse_error] == NULL) {
 		_sr_core_ert_list.init_parse_error = -1;
 	} else {
@@ -59,23 +59,29 @@ void sr_core_ert_init(void)
 /**
  *
  */
-void sr_core_ert_run(sip_msg_t *msg, int e)
+int sr_core_ert_run(sip_msg_t *msg, int e)
 {
 	struct run_act_ctx ctx;
 	int rtb;
 
 	switch(e) {
 		case SR_CORE_ERT_RECEIVE_PARSE_ERROR:
-			if(likely(_sr_core_ert_list.init_parse_error <= 0))
-				return;
+			if(likely(_sr_core_ert_list.init_parse_error < 0)) {
+				/* no event route defined */
+				return 0;
+			}
 			rtb = get_route_type();
 			set_route_type(REQUEST_ROUTE);
 			init_run_actions_ctx(&ctx);
 			run_top_route(event_rt.rlist[_sr_core_ert_list.init_parse_error],
 					msg, &ctx);
 			set_route_type(rtb);
+			if(ctx.run_flags & DROP_R_F) {
+				return -1;
+			}
 			break;
 	}
+	return 0;
 }
 
 /**
@@ -250,6 +256,12 @@ int sr_event_register_cb(int type, sr_event_cb_f f)
 			if(i == SREV_CB_LIST_SIZE)
 				return -1;
 			break;
+		case SREV_TCP_WS_HANDSHAKE:
+			if(_sr_events_list.tcp_ws_handshake == 0)
+				_sr_events_list.tcp_ws_handshake = f;
+			else
+				return -1;
+			break;
 		default:
 			return -1;
 	}
@@ -420,6 +432,12 @@ int sr_event_exec(int type, sr_event_param_t *evp)
 				return ret;
 			} else
 				return 1;
+		case SREV_TCP_WS_HANDSHAKE:
+			if(unlikely(_sr_events_list.tcp_ws_handshake != 0)) {
+				ret = _sr_events_list.tcp_ws_handshake(evp);
+				return ret;
+			} else
+				return 1;
 		default:
 			return -1;
 	}
@@ -467,6 +485,8 @@ int sr_event_enabled(int type)
 			return (_sr_events_list.sip_reply_out[0] != 0) ? 1 : 0;
 		case SREV_TCP_WS_CLOSE:
 			return (_sr_events_list.tcp_ws_close[0] != 0) ? 1 : 0;
+		case SREV_TCP_WS_HANDSHAKE:
+			return (_sr_events_list.tcp_ws_handshake != 0) ? 1 : 0;
 	}
 	return 0;
 }

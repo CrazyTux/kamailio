@@ -42,9 +42,8 @@
 #include "../../core/parser/parse_content.h"
 #include "../../core/parser/parser_f.h"
 #include "../../core/parser/sdp/sdp_helpr_funcs.h"
+#include "../../core/parser/parse_bytes.h"
 
-#define READ(val) \
-	(*(val + 0) + (*(val + 1) << 8) + (*(val + 2) << 16) + (*(val + 3) << 24))
 #define advance(_ptr, _n, _str, _error)           \
 	do {                                          \
 		if((_ptr) + (_n) > (_str).s + (_str).len) \
@@ -104,15 +103,15 @@ int check_content_type(struct sip_msg *msg)
 	}
 	p = str_type.s;
 	advance(p, 4, str_type, error_1);
-	x = READ(p - 4);
+	x = ksr_read_u32le(p - 4);
 	if(!one_of_16(x, appl))
 		goto other;
 	advance(p, 4, str_type, error_1);
-	x = READ(p - 4);
+	x = ksr_read_u32le(p - 4);
 	if(!one_of_16(x, icat))
 		goto other;
 	advance(p, 3, str_type, error_1);
-	x = READ(p - 3) & 0x00ffffff;
+	x = ksr_read_u24le(p - 3);
 	if(!one_of_8(x, ion_))
 		goto other;
 
@@ -128,7 +127,7 @@ int check_content_type(struct sip_msg *msg)
 		advance(p, 1, str_type, error_1);
 
 	advance(p, 3, str_type, error_1);
-	x = READ(p - 3) & 0x00ffffff;
+	x = ksr_read_u24le(p - 3);
 	if(!one_of_8(x, sdp_))
 		goto other;
 
@@ -267,37 +266,6 @@ done:
 
 	/*LM_DBG("DEBUG:extract_body:=|%.*s|\n",body->len,body->s);*/
 	return 1;
-}
-
-/*
- * ser_memmem() returns the location of the first occurrence of data
- * pattern b2 of size len2 in memory block b1 of size len1 or
- * NULL if none is found. Obtained from NetBSD.
- */
-void *ser_memmem(const void *b1, const void *b2, size_t len1, size_t len2)
-{
-	/* Initialize search pointer */
-	char *sp = (char *)b1;
-
-	/* Initialize pattern pointer */
-	char *pp = (char *)b2;
-
-	/* Initialize end of search address space pointer */
-	char *eos = sp + len1 - len2;
-
-	/* Sanity check */
-	if(!(b1 && b2 && len1 && len2))
-		return NULL;
-
-	while(sp <= eos) {
-		if(*sp == *pp)
-			if(memcmp(sp, pp, len2) == 0)
-				return sp;
-
-		sp++;
-	}
-
-	return NULL;
 }
 
 /*

@@ -55,6 +55,7 @@ static int w_sr_msg_async_pull(sip_msg_t *msg, char *pcallid, char *pmsgid,
 		char *pgname, char *prname, char *prmode);
 static int w_sr_msg_rm(sip_msg_t *msg, char *pcallid, char *pmsgid);
 static int w_sr_msg_check(sip_msg_t *msg, char *p1, char *p2);
+static int w_sr_msg_match(sip_msg_t *msg, char *pmode, char *p2);
 
 static void siprepo_timer_exec(unsigned int ticks, int worker, void *param);
 
@@ -62,16 +63,9 @@ static int fixup_sr_msg_async_pull(void **param, int param_no);
 static int fixup_free_sr_msg_async_pull(void **param, int param_no);
 
 /* clang-format off */
-typedef struct sworker_task_param {
-	char *buf;
-	int len;
-	receive_info_t rcv;
-	str xdata;
-} sworker_task_param_t;
-
 static cmd_export_t cmds[]={
 	{"sr_msg_push", (cmd_function)w_sr_msg_push, 2, fixup_spve_igp,
-		fixup_free_spve_null, REQUEST_ROUTE|CORE_ONREPLY_ROUTE},
+		fixup_free_spve_igp, REQUEST_ROUTE|CORE_ONREPLY_ROUTE},
 	{"sr_msg_pull", (cmd_function)w_sr_msg_pull, 4, fixup_sssi,
 		fixup_free_sssi, REQUEST_ROUTE|CORE_ONREPLY_ROUTE},
 	{"sr_msg_async_pull", (cmd_function)w_sr_msg_async_pull, 5, fixup_sr_msg_async_pull,
@@ -80,6 +74,8 @@ static cmd_export_t cmds[]={
 		fixup_free_spve_spve, REQUEST_ROUTE|CORE_ONREPLY_ROUTE},
 	{"sr_msg_check", (cmd_function)w_sr_msg_check, 0, 0,
 		0, ANY_ROUTE},
+	{"sr_msg_match", (cmd_function)w_sr_msg_match, 1, fixup_igp_null,
+		fixup_free_igp_null, ANY_ROUTE},
 	{0, 0, 0, 0, 0, 0}
 };
 
@@ -111,11 +107,31 @@ struct module_exports exports = {
  */
 static int mod_init(void)
 {
+	if(_siprepo_table_size <= 0) {
+		LM_ERR("invalid hash_size value: %d\n", _siprepo_table_size);
+		return -1;
+	}
+	if(_siprepo_expire <= 0) {
+		LM_ERR("invalid expire value: %d\n", _siprepo_expire);
+		return -1;
+	}
+	if(_siprepo_timer_interval <= 0) {
+		LM_ERR("invalid timer_interval value: %d\n", _siprepo_timer_interval);
+		return -1;
+	}
+	if(_siprepo_timer_procs <= 0) {
+		LM_ERR("invalid timer_procs value: %d\n", _siprepo_timer_procs);
+		return -1;
+	}
+
 	if(siprepo_table_init() < 0) {
 		LM_ERR("failed to initialize hash table\n");
 		return -1;
 	}
-	register_basic_timers(_siprepo_timer_procs);
+	if(register_basic_timers(_siprepo_timer_procs) < 0) {
+		LM_ERR("failed to register timer processes\n");
+		return -1;
+	}
 	return 0;
 }
 
@@ -345,7 +361,7 @@ static int ki_sr_msg_check(sip_msg_t *msg)
 {
 	int ret;
 
-	ret = siprepo_msg_check(msg);
+	ret = siprepo_msg_check(msg, 0);
 
 	if(ret <= 0) {
 		return (ret - 1);
@@ -359,6 +375,36 @@ static int ki_sr_msg_check(sip_msg_t *msg)
 static int w_sr_msg_check(sip_msg_t *msg, char *p1, char *p2)
 {
 	return ki_sr_msg_check(msg);
+}
+
+/**
+ *
+ */
+static int ki_sr_msg_match(sip_msg_t *msg, int mode)
+{
+	int ret;
+
+	ret = siprepo_msg_check(msg, (unsigned int)mode);
+
+	if(ret <= 0) {
+		return (ret - 1);
+	}
+	return ret;
+}
+
+/**
+ *
+ */
+static int w_sr_msg_match(sip_msg_t *msg, char *pmode, char *p2)
+{
+	int vmode = 0;
+
+	if(fixup_get_ivalue(msg, (gparam_t *)pmode, &vmode) != 0) {
+		LM_ERR("cannot get mode value\n");
+		return -1;
+	}
+
+	return ki_sr_msg_match(msg, vmode);
 }
 
 static void siprepo_timer_exec(unsigned int ticks, int worker, void *param)
@@ -394,6 +440,11 @@ static sr_kemi_t sr_kemi_sworker_exports[] = {
 	{ str_init("siprepo"), str_init("sr_msg_check"),
 		SR_KEMIP_INT, ki_sr_msg_check,
 		{ SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("siprepo"), str_init("sr_msg_match"),
+		SR_KEMIP_INT, ki_sr_msg_match,
+		{ SR_KEMIP_INT, SR_KEMIP_NONE, SR_KEMIP_NONE,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
 

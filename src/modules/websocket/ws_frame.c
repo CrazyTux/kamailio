@@ -40,9 +40,12 @@
 #include "../../core/ut.h"
 #include "../../core/tcp_conn.h"
 #include "../../core/tcp_read.h"
+#include "../../core/tcp_reactor.h"
 #include "../../core/tcp_server.h"
+#include "../../core/globals.h"
 #include "../../core/counters.h"
 #include "../../core/mem/mem.h"
+#include "../../core/rand/kam_rand.h"
 #include "ws_conn.h"
 #include "ws_frame.h"
 #include "websocket.h"
@@ -105,6 +108,10 @@ typedef enum
 #define OPCODE_PONG (0xa)
 /* 0xb - 0xf are reserved for further control frames */
 
+/* RFC 6455 5.5: control frames (CLOSE/PING/PONG) carry at most 125 payload
+ * bytes and must not be fragmented. */
+#define WS_CTRL_PAYLOAD_MAX (125)
+
 int ws_keepalive_mechanism = DEFAULT_KEEPALIVE_MECHANISM;
 str ws_ping_application_data = STR_NULL;
 
@@ -140,12 +147,15 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 {
 	int pos = 0, extended_length;
 	unsigned int frame_length;
+	unsigned int header_length;
 	char *send_buf;
 	struct tcp_connection *con;
 	struct dest_info dst;
 	union sockaddr_union *from = NULL;
 	union sockaddr_union local_addr;
 	int sub_proto;
+	unsigned int i;
+	int use_mask;
 
 	LM_DBG("encoding WebSocket frame\n");
 
@@ -187,19 +197,14 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 			return -1;
 	}
 
-	/* validate the second byte */
-	if(frame->mask) {
-		LM_ERR("this is a server - all messages sent will be "
-			   "unmasked\n");
-		return -1;
-	}
+	use_mask = (frame->wsc->role == WS_ROLE_CLIENT) ? 1 : 0;
 
 	if(frame->payload_len < 126)
 		extended_length = 0;
 	else if(frame->payload_len <= USHRT_MAX)
 		extended_length = 2;
 	else if(frame->payload_len < UINT_MAX)
-		extended_length = 4;
+		extended_length = 8;
 	else {
 		LM_ERR(NAME " only supports WebSocket frames with payload "
 					"< %u\n",
@@ -208,7 +213,8 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 	}
 
 	/* Allocate send buffer and build frame */
-	frame_length = frame->payload_len + extended_length + 2;
+	header_length = 2 + extended_length + ((use_mask) ? 4 : 0);
+	frame_length = frame->payload_len + header_length;
 	if((send_buf = pkg_malloc(sizeof(char) * frame_length)) == NULL) {
 		PKG_MEM_ERROR_FMT("for send buffer\n");
 		return -1;
@@ -216,19 +222,31 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 	memset(send_buf, 0, sizeof(char) * frame_length);
 	send_buf[pos++] = 0x80 | (frame->opcode & 0xff);
 	if(extended_length == 0)
-		send_buf[pos++] = (frame->payload_len & 0xff);
+		send_buf[pos++] = (frame->payload_len & 0xff) | ((use_mask) ? 0x80 : 0);
 	else if(extended_length == 2) {
-		send_buf[pos++] = 126;
+		send_buf[pos++] = 126 | ((use_mask) ? 0x80 : 0);
 		send_buf[pos++] = (frame->payload_len & 0xff00) >> 8;
 		send_buf[pos++] = (frame->payload_len & 0x00ff) >> 0;
 	} else {
-		send_buf[pos++] = 127;
+		send_buf[pos++] = 127 | ((use_mask) ? 0x80 : 0);
+		pos += 4; /* 64-bit length, upper 32 bits left zero by memset */
 		send_buf[pos++] = (frame->payload_len & 0xff000000) >> 24;
 		send_buf[pos++] = (frame->payload_len & 0x00ff0000) >> 16;
 		send_buf[pos++] = (frame->payload_len & 0x0000ff00) >> 8;
 		send_buf[pos++] = (frame->payload_len & 0x000000ff) >> 0;
 	}
+	if(use_mask) {
+		for(i = 0; i < 4; i++) {
+			frame->masking_key[i] = (unsigned char)(kam_rand() & 0xff);
+			send_buf[pos++] = frame->masking_key[i];
+		}
+	}
 	memcpy(&send_buf[pos], frame->payload_data, frame->payload_len);
+	if(use_mask) {
+		for(i = 0; i < frame->payload_len; i++) {
+			send_buf[pos + i] ^= frame->masking_key[i % 4];
+		}
+	}
 
 	if((con = tcpconn_get(frame->wsc->id, 0, 0, 0, 0)) == NULL) {
 		LM_WARN("TCP/TLS connection get failed\n");
@@ -242,7 +260,7 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 		dst.send_flags.f |= SND_F_CON_CLOSE;
 		if(wsconn_rm(frame->wsc, WSCONN_EVENTROUTE_YES) < 0) {
 			LM_ERR("removing WebSocket connection\n");
-			tcpconn_put(con);
+			tcpconn_chld_put(con);
 			pkg_free(send_buf);
 			return -1;
 		}
@@ -252,7 +270,7 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 		if(unlikely(tcp_disable)) {
 			LM_WARN("TCP disabled\n");
 			pkg_free(send_buf);
-			tcpconn_put(con);
+			tcpconn_chld_put(con);
 			return -1;
 		}
 	}
@@ -261,7 +279,7 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 		if(unlikely(tls_disable)) {
 			LM_WARN("TLS disabled\n");
 			pkg_free(send_buf);
-			tcpconn_put(con);
+			tcpconn_chld_put(con);
 			return -1;
 		}
 	}
@@ -288,7 +306,7 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 			update_stat(ws_msrp_failed_connections, 1);
 		if(wsconn_rm(frame->wsc, WSCONN_EVENTROUTE_YES) < 0)
 			LM_ERR("removing WebSocket connection\n");
-		tcpconn_put(con);
+		tcpconn_chld_put(con);
 		return -1;
 	}
 
@@ -303,7 +321,7 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 	}
 
 	pkg_free(send_buf);
-	tcpconn_put(con);
+	tcpconn_chld_put(con);
 	return 0;
 }
 
@@ -428,12 +446,20 @@ static int decode_and_validate_ws_frame(ws_frame_t *frame,
 			return -1;
 	}
 
-	if(!frame->mask) {
-		LM_WARN("this is a server - all received messages must be "
-				"masked\n");
-		*err_code = 1002;
-		*err_text = str_status_protocol_error;
-		return -1;
+	if(frame->wsc->role == WS_ROLE_SERVER) {
+		if(!frame->mask) {
+			LM_WARN("server-side websocket received unmasked client frame\n");
+			*err_code = 1002;
+			*err_text = str_status_protocol_error;
+			return -1;
+		}
+	} else {
+		if(frame->mask) {
+			LM_WARN("client-side websocket received masked server frame\n");
+			*err_code = 1002;
+			*err_text = str_status_protocol_error;
+			return -1;
+		}
 	}
 
 	/* Decode and validate length */
@@ -474,9 +500,10 @@ static int decode_and_validate_ws_frame(ws_frame_t *frame,
 		mask_start = 2;
 
 	if((unsigned long long)len
-			!= (unsigned long long)frame->payload_len + mask_start + 4) {
+			!= (unsigned long long)frame->payload_len + mask_start
+					   + ((frame->mask) ? 4 : 0)) {
 		LM_WARN("message not complete frame size %u but received %u\n",
-				frame->payload_len + mask_start + 4, len);
+				frame->payload_len + mask_start + ((frame->mask) ? 4 : 0), len);
 		*err_code = 1002;
 		*err_text = str_status_protocol_error;
 		return -1;
@@ -488,18 +515,34 @@ static int decode_and_validate_ws_frame(ws_frame_t *frame,
 		*err_text = str_status_message_too_big;
 		return -1;
 	}
-	/* Decode mask */
-	frame->masking_key[0] = (buf[mask_start + 0] & 0xff);
-	frame->masking_key[1] = (buf[mask_start + 1] & 0xff);
-	frame->masking_key[2] = (buf[mask_start + 2] & 0xff);
-	frame->masking_key[3] = (buf[mask_start + 3] & 0xff);
 
-	frame->payload_data = &buf[mask_start + 4];
+	/* RFC 6455 5.5: All control frames (opcodes 0x8 to 0xF) must have a
+        * payload length of 125 bytes or less. Reject over-long control frames
+        * to prevent protocol violations and potential PING->PONG reflection amplification. */
+	if((frame->opcode & 0x08) && frame->payload_len > WS_CTRL_PAYLOAD_MAX) {
+		LM_WARN("control frame too long (opcode 0x%x, len %u)\n",
+				(unsigned int)frame->opcode, frame->payload_len);
+		*err_code = 1002;
+		*err_text = str_status_protocol_error;
+		return -1;
+	}
+	if(frame->mask) {
+		/* Decode mask */
+		frame->masking_key[0] = (buf[mask_start + 0] & 0xff);
+		frame->masking_key[1] = (buf[mask_start + 1] & 0xff);
+		frame->masking_key[2] = (buf[mask_start + 2] & 0xff);
+		frame->masking_key[3] = (buf[mask_start + 3] & 0xff);
 
-	/* Decode and unmask payload */
-	for(i = 0; i < frame->payload_len; i++) {
-		j = i % 4;
-		frame->payload_data[i] = frame->payload_data[i] ^ frame->masking_key[j];
+		frame->payload_data = &buf[mask_start + 4];
+
+		/* Decode and unmask payload */
+		for(i = 0; i < frame->payload_len; i++) {
+			j = i % 4;
+			frame->payload_data[i] =
+					frame->payload_data[i] ^ frame->masking_key[j];
+		}
+	} else {
+		frame->payload_data = &buf[mask_start];
 	}
 
 	LM_DBG("Rx (decoded) (len %u): %.*s\n", frame->payload_len,
@@ -562,6 +605,22 @@ static int handle_pong(ws_frame_t *frame)
 	return 0;
 }
 
+/* Deliver a decoded, defragmented WS SIP payload.
+ *
+ * mode 2 (tcp reactor): the frame codec runs on a PROC_TCP_MAIN pool thread
+ * (single-owner under the connection shield). Running config here would execute
+ * the SIP route on a pool thread, so instead the payload is handed to a worker
+ * over the reactor dispatch socket - exactly like plain SIP / HEP3 / MSRP. The
+ * dispatch copies the buffer into shm, so the caller may reset frag_buf right
+ * after. Modes 0/1 keep the inline receive_msg() (worker owns the fd there). */
+static inline int ws_deliver_sip(
+		char *buf, unsigned int len, struct receive_info *rcv)
+{
+	if(unlikely(ksr_tcp_main_threads == 2))
+		return tcp_reactor_dispatch_msg(buf, len, 0, rcv);
+	return receive_msg(buf, len, rcv);
+}
+
 int ws_frame_receive(sr_event_param_t *evp)
 {
 	ws_frame_t frame;
@@ -601,6 +660,15 @@ int ws_frame_receive(sr_event_param_t *evp)
 	switch(opcode) {
 		case OPCODE_CONTINUATION:
 			if(likely(frame.wsc->sub_protocol == SUB_PROTOCOL_SIP)) {
+				if(frame.wsc->frag_progress == 0) {
+					LM_WARN("received continuation frame without fragmented "
+							"message in progress\n");
+					if(close_connection(&frame.wsc, LOCAL_CLOSE, 1002,
+							   str_status_protocol_error)
+							< 0)
+						LM_ERR("closing connection\n");
+					return -1;
+				}
 				if(frame.wsc->frag_buf.len + frame.payload_len >= BUF_SIZE) {
 					LM_ERR("Buffer overflow assembling websocket fragments %d "
 						   "+ %d = %d\n",
@@ -615,8 +683,10 @@ int ws_frame_receive(sr_event_param_t *evp)
 				frame.wsc->frag_buf.s[frame.wsc->frag_buf.len] = '\0';
 
 				if(frame.fin) {
-					ret = receive_msg(frame.wsc->frag_buf.s,
+					ret = ws_deliver_sip(frame.wsc->frag_buf.s,
 							frame.wsc->frag_buf.len, tcpinfo->rcv);
+					frame.wsc->frag_buf.len = 0;
+					frame.wsc->frag_progress = 0;
 					wsconn_put(frame.wsc);
 					return ret;
 				}
@@ -630,6 +700,15 @@ int ws_frame_receive(sr_event_param_t *evp)
 		case OPCODE_TEXT_FRAME:
 		case OPCODE_BINARY_FRAME:
 			if(likely(frame.wsc->sub_protocol == SUB_PROTOCOL_SIP)) {
+				if(frame.wsc->frag_progress != 0) {
+					LM_WARN("received new data frame while fragmented message "
+							"is still in progress\n");
+					if(close_connection(&frame.wsc, LOCAL_CLOSE, 1002,
+							   str_status_protocol_error)
+							< 0)
+						LM_ERR("closing connection\n");
+					return -1;
+				}
 				LM_DBG("Rx SIP (or text) message:\n%.*s\n", frame.payload_len,
 						frame.payload_data);
 				update_stat(ws_sip_received_frames, 1);
@@ -648,12 +727,13 @@ int ws_frame_receive(sr_event_param_t *evp)
 
 					wsconn_put(frame.wsc);
 
-					return receive_msg(frame.payload_data, frame.payload_len,
+					return ws_deliver_sip(frame.payload_data, frame.payload_len,
 							tcpinfo->rcv);
 				} else {
 					memcpy(frame.wsc->frag_buf.s, frame.payload_data,
 							frame.payload_len);
 					frame.wsc->frag_buf.len = frame.payload_len;
+					frame.wsc->frag_progress = 1;
 					frame.wsc->frag_buf.s[frame.wsc->frag_buf.len] = '\0';
 					wsconn_put(frame.wsc);
 					return 0;
@@ -662,6 +742,17 @@ int ws_frame_receive(sr_event_param_t *evp)
 				LM_DBG("Rx MSRP frame:\n%.*s\n", frame.payload_len,
 						frame.payload_data);
 				update_stat(ws_msrp_received_frames, 1);
+				/* mode 2: dispatch the MSRP payload to a worker tagged as an MSRP
+				 * frame, so it runs the SREV_TCP_MSRP_FRAME decode there - the
+				 * same worker path as native MSRP-over-TCP. The worker sources the
+				 * conn id from rcv->proto_reserved1. */
+				if(unlikely(ksr_tcp_main_threads == 2)) {
+					ret = tcp_reactor_dispatch_msg(frame.payload_data,
+							frame.payload_len, F_TCP_REQ_MSRP_FRAME,
+							tcpinfo->rcv);
+					wsconn_put(frame.wsc);
+					return ret;
+				}
 				if(likely(sr_event_enabled(SREV_TCP_MSRP_FRAME))) {
 					tcp_event_info_t tev;
 					memset(&tev, 0, sizeof(tcp_event_info_t));
@@ -717,6 +808,7 @@ int ws_frame_transmit(sr_event_param_t *evp)
 {
 	ws_event_info_t *wsev = (ws_event_info_t *)evp->data;
 	ws_frame_t frame;
+	conn_close_t cc;
 
 	memset(&frame, 0, sizeof(frame));
 	frame.fin = 1;
@@ -741,7 +833,10 @@ int ws_frame_transmit(sr_event_param_t *evp)
 
 	LM_DBG("Tx message:\n%.*s\n", frame.payload_len, frame.payload_data);
 
-	if(encode_and_send_ws_frame(&frame, CONN_CLOSE_DONT) < 0) {
+	/* close-after-send from the script, e.g. set_reply_close() */
+	cc = (wsev->send_flags.f & SND_F_CON_CLOSE) ? CONN_CLOSE_DO
+												: CONN_CLOSE_DONT;
+	if(encode_and_send_ws_frame(&frame, cc) < 0) {
 		LM_ERR("sending message\n");
 
 		wsconn_put(frame.wsc);
@@ -829,7 +924,7 @@ void ws_keepalive(unsigned int ticks, void *param)
 								wsc->id, wsc);
 						wsc->state = WS_S_CLOSING;
 					} else {
-						tcpconn_put(con);
+						tcpconn_chld_put(con);
 					}
 				}
 			} else {

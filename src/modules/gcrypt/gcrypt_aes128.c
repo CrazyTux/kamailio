@@ -50,13 +50,13 @@ void *aes128_context_init(uint8_t key[16])
 
 void aes128_context_destroy(void **context)
 {
-	if(context != NULL) {
+	if(context != NULL && *context != NULL) {
 		gcry_cipher_close(*context);
 		*context = NULL;
 	}
 }
 
-int aes128_encrypt(uint8_t *output, uint8_t *input, void *context)
+int aes128_encrypt(void *context, uint8_t *input, uint8_t *output)
 {
 	if(context == NULL) {
 		LM_ERR("aes128_encrypt: context is NULL\n");
@@ -83,7 +83,7 @@ int aes128_encrypt(uint8_t *output, uint8_t *input, void *context)
 	return 0;
 }
 
-int aes128_decrypt(uint8_t *output, uint8_t *input, void *context)
+int aes128_decrypt(void *context, uint8_t *input, uint8_t *output)
 {
 	if(context == NULL) {
 		LM_ERR("aes128_decrypt: context is NULL\n");

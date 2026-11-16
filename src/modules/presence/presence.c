@@ -160,17 +160,21 @@ shtable_t subs_htable = NULL;
 int pres_subs_dbmode = WRITE_BACK;
 int pres_sphere_enable = 0;
 int pres_timeout_rm_subs = 1;
+int pres_refresh_record_route = 0;
 int pres_send_fast_notify = 1;
 int publ_cache_mode = PS_PCACHE_HYBRID;
 int pres_waitn_time = 5;
 int pres_notifier_poll_rate = 10;
 int pres_notifier_processes = 1;
+int pres_notifier_cluster_size = 1;
+int pres_notifier_cluster_id = 0;
 int pres_force_delete = 0;
 int pres_startup_mode = 1;
 str pres_xavp_cfg = {0};
 int pres_retrieve_order = 0;
 str pres_retrieve_order_by = str_init("priority");
 int pres_enable_dmq = 0;
+str pres_dmq_peer_id = str_init("presence");
 int pres_enable_pres_dmq = 1;
 int pres_enable_pres_sync_dmq = 1;
 int pres_enable_subs_dmq = 0;
@@ -228,6 +232,8 @@ static param_export_t params[]={
 	{ "waitn_time",             PARAM_INT, &pres_waitn_time },
 	{ "notifier_poll_rate",     PARAM_INT, &pres_notifier_poll_rate },
 	{ "notifier_processes",     PARAM_INT, &pres_notifier_processes },
+	{ "notifier_cluster_size",  PARAM_INT, &pres_notifier_cluster_size },
+	{ "notifier_cluster_id",    PARAM_INT, &pres_notifier_cluster_id },
 	{ "force_delete",           PARAM_INT, &pres_force_delete },
 	{ "startup_mode",           PARAM_INT, &pres_startup_mode },
 	{ "expires_offset",         PARAM_INT, &pres_expires_offset },
@@ -244,6 +250,7 @@ static param_export_t params[]={
 	{ "send_fast_notify",       PARAM_INT, &pres_send_fast_notify},
 	{ "fetch_rows",             PARAM_INT, &pres_fetch_rows},
 	{ "db_table_lock_type",     PARAM_INT, &pres_db_table_lock_type},
+	{ "refresh_record_route",   PARAM_INT, &pres_refresh_record_route},
 	{ "local_log_level",        PARAM_INT, &pres_local_log_level},
 	{ "local_log_facility",     PARAM_STRING, &pres_log_facility_str},
 	{ "subs_remove_match",      PARAM_INT, &pres_subs_remove_match},
@@ -263,6 +270,7 @@ static param_export_t params[]={
 	{ "delete_same_subs",       PARAM_INT, &pres_delete_same_subs},
 	{ "timer_mode",             PARAM_INT, &pres_timer_mode},
 	{ "subs_respond_200",       PARAM_INT, &pres_subs_respond_200},
+	{ "dmq_peer_id",            PARAM_STR, &pres_dmq_peer_id},
 
 	{0,0,0}
 };
@@ -511,6 +519,18 @@ static int mod_init(void)
 
 	if(pres_notifier_processes < 0 || pres_subs_dbmode != DB_ONLY) {
 		pres_notifier_processes = 0;
+	}
+
+	if(pres_notifier_cluster_size <= 0) {
+		pres_notifier_cluster_size = 1;
+	}
+
+	if(pres_notifier_cluster_id < 0
+			|| pres_notifier_cluster_id >= pres_notifier_cluster_size) {
+		LM_ERR("notifier_cluster_id (%d) must be in [0, notifier_cluster_size) "
+			   "(notifier_cluster_size=%d)\n",
+				pres_notifier_cluster_id, pres_notifier_cluster_size);
+		goto dberror;
 	}
 
 	if(pres_notifier_processes > 0) {
@@ -1391,12 +1411,13 @@ static int update_pw_dialogs_dbonlymode(subs_t *subs, subs_t **subs_array)
 		db_vals[n_update_cols].val.int_val =
 				(int)((kam_rand() / (KAM_RAND_MAX + 1.0))
 						* (pres_waitn_time * pres_notifier_poll_rate
-								* pres_notifier_processes));
+								* pres_notifier_processes
+								* pres_notifier_cluster_size));
 	} else {
 		db_vals[n_update_cols].val.int_val =
 				core_case_hash(&subs->callid, &subs->from_tag, 0)
 				% (pres_waitn_time * pres_notifier_poll_rate
-						* pres_notifier_processes);
+						* pres_notifier_processes * pres_notifier_cluster_size);
 	}
 	n_update_cols++;
 

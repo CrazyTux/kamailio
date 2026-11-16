@@ -1,5 +1,7 @@
 #!/bin/bash
 COMMIT_MESSAGE_SUBJECT_FORMAT="%s"
+COMMIT_MESSAGE_BODY_FORMAT="%b"
+BODY_AI_CHECK="Copilot|Claude|Cursor|Codex|AI"
 
 set -eu
 
@@ -14,9 +16,28 @@ git_log_format() {
   git log -1 --pretty=format:"$pattern" "$reference"
 }
 
+check_body() {
+  local commit="$1"
+  local body="$2"
+
+  # AI clutter
+  if echo "${body}" | grep -qiE "Co-authored-by:.*(${BODY_AI_CHECK})" ; then
+    fail "[${commit}] AI Co-Author detected"
+  fi
+  if echo "${body}" | grep -qiE "(${BODY_AI_CHECK})-session:.*" ; then
+    fail "[${commit}] AI session detected"
+  fi
+}
+
 check_subject() {
   local commit="$1"
   local subject="$2"
+
+  # special cases
+  if [[ "${subject}" =~ ^Revert\ .*$ ]] ; then
+    echo "[${commit}] is a git revert commit, OK[Revert]"
+    return
+  fi
 
   # get the prefix
   if ! [[ "${subject}" =~ ^([^:]+):.*$ ]] ; then
@@ -80,6 +101,7 @@ check_subject() {
   fail "[${commit}] unknown prefix:'${prefix}'"
 }
 
+fetch_depth="${FETCH_DEPTH:-50}"
 target="${GITHUB_BASE_REF:-master}"
 if [ "${CI:-}" ]; then
     git rev-parse -q --no-revs --verify "origin/${target}" || \
@@ -90,19 +112,21 @@ if [ "${CI:-}" ]; then
         git fetch origin --depth=1 tag "${target}"
     # Ensure that the target revision has some history
     target_sha=$(git rev-parse -q --verify "origin/${target}" || git rev-parse -q --verify "${target}")
-    git fetch -q "--depth=${FETCH_DEPTH:-50}" origin "+${target_sha}"
+    git fetch -q "--depth=${fetch_depth}" origin "+${target_sha}"
 else
     target_sha=$(git rev-parse -q --verify "${target}") || die "fatal: couldn't find ref ${target}"
 fi
 
 ref=${ref:-HEAD}
 # Ensure that the ref revision has some history
-git fetch -q "--depth=${FETCH_DEPTH:-50}" origin "+${ref}"
+git fetch -q "--depth=${fetch_depth}" origin "+${ref}"
 src_sha=$(git rev-parse -q --verify "${ref}") || die "fatal: couldn't find ref ${ref}"
 echo "Checking $(git rev-list --count "${src_sha}" "^${target_sha}") commits since revision ${target_sha}"
 for commit in $(git rev-list --reverse "${src_sha}" "^${target_sha}"); do
-  COMMIT_MESSAGE_SUBJECT=$(git_log_format "${COMMIT_MESSAGE_SUBJECT_FORMAT}" "${commit}")
-  check_subject "${commit}" "${COMMIT_MESSAGE_SUBJECT}"
+  commit_message_subject=$(git_log_format "${COMMIT_MESSAGE_SUBJECT_FORMAT}" "${commit}")
+  check_subject "${commit}" "${commit_message_subject}"
+  commit_message_body=$(git_log_format "${COMMIT_MESSAGE_BODY_FORMAT}" "${commit}")
+  check_body "${commit}" "${commit_message_body}"
 done
 
 echo "Result: ${res}"

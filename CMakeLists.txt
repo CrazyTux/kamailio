@@ -23,7 +23,7 @@ endif()
 # ---- Project settings ----
 
 # Set the version number
-set(EXTRAVERSION "-dev0")
+set(EXTRAVERSION "-dev1")
 set(RELEASE "${PROJECT_VERSION}${EXTRAVERSION}")
 
 message(STATUS "PROJECT_VERSION: ${PROJECT_VERSION}")
@@ -79,6 +79,12 @@ add_subdirectory(utils/kamcmd)
 # Include it here due to calling a script where we need the base binary dir
 # and scirpts are using {CMAKE_BINARY_DIR} from where they where first included.
 include(${CMAKE_SOURCE_DIR}/cmake/dbschema.cmake)
+
+# ----------
+# SBOM (CycloneDX) generation, on demand: cmake --build <dir> --target sbom-cyclonedx
+# Included after add_subdirectory(src) so module targets and the
+# ADDED_MODULES_LIST global property are populated.
+include(${CMAKE_SOURCE_DIR}/cmake/sbom-cyclonedx.cmake)
 
 # ----------
 # Packaging

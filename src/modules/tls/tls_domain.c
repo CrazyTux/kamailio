@@ -25,6 +25,8 @@
  */
 
 #include <stdlib.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <openssl/opensslv.h>
 #include <openssl/bn.h>
@@ -46,6 +48,7 @@ extern EVP_PKEY *tls_engine_private_key(const char *key_id);
 #include "../../core/pt.h"
 #include "../../core/cfg/cfg.h"
 #include "../../core/dprint.h"
+#include "../../core/sr_module.h"
 #include "tls_config.h"
 #include "tls_server.h"
 #include "tls_util.h"
@@ -95,9 +98,9 @@ static void setup_ecdh(SSL_CTX *ctx)
 #ifndef OPENSSL_NO_DH
 
 /*
- * not needed for OpenSSL 1.1.0+ and LibreSSL
+ * not needed for OpenSSL 1.1.0+
  */
-#if !defined(SSL_CTX_set_dh_auto)
+#if !defined(SSL_CTX_set_dh_auto) && !defined(OPENSSL_IS_AWSLC)
 static unsigned char dh3072_p[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 		0xFF, 0xC9, 0x0F, 0xDA, 0xA2, 0x21, 0x68, 0xC2, 0x34, 0xC4, 0xC6, 0x62,
 		0x8B, 0x80, 0xDC, 0x1C, 0xD1, 0x29, 0x02, 0x4E, 0x08, 0x8A, 0x67, 0xCC,
@@ -140,10 +143,10 @@ static unsigned char dh3072_g[] = {0x02};
 static void setup_dh(SSL_CTX *ctx)
 {
 /*
- * not needed for OpenSSL 1.1.0+ and LibreSSL
+ * not needed for OpenSSL 1.1.0+
  * DH_new() is deprecated in OpenSSL 3
  */
-#if !defined(SSL_CTX_set_dh_auto)
+#if !defined(SSL_CTX_set_dh_auto) && !defined(OPENSSL_IS_AWSLC)
 	DH *dh;
 	BIGNUM *p;
 	BIGNUM *g;
@@ -169,7 +172,7 @@ static void setup_dh(SSL_CTX *ctx)
 	SSL_CTX_set_tmp_dh(ctx, dh);
 
 	DH_free(dh);
-#else
+#elif !defined(OPENSSL_IS_AWSLC)
 	SSL_CTX_set_dh_auto(ctx, 1);
 #endif
 }
@@ -204,6 +207,7 @@ tls_domain_t *tls_new_domain(int type, struct ip_addr *ip, unsigned short port)
 	d->verify_depth = -1;
 	d->require_cert = -1;
 	d->verify_client = -1;
+	d->verify_server_name = -1;
 	return d;
 }
 
@@ -220,12 +224,19 @@ void tls_free_domain(tls_domain_t *d)
 	if(!d)
 		return;
 
-	/* TODO: in multi-threaded mode this needs to be freed in PROC_TCP_MAIN */
-	if(d->ctx && ksr_tcp_main_threads == 0) {
-		procs_no = get_max_procs();
-		for(i = 0; i < procs_no; i++) {
-			if(d->ctx[i])
-				SSL_CTX_free(d->ctx[i]);
+	if(d->ctx) {
+		if(ksr_tcp_main_threads == 0) {
+			procs_no = TLS_CTX_NO();
+			for(i = 0; i < procs_no; i++) {
+				if(d->ctx[i]) {
+					SSL_CTX_free(d->ctx[i]);
+				}
+			}
+		} else {
+			/* In multi-threaded mode this must be freed in PROC_TCP_MAIN */
+			if(d->ctx[0] && tls_child_rank == PROC_TCP_MAIN) {
+				SSL_CTX_free(d->ctx[0]);
+			}
 		}
 		shm_free(d->ctx);
 	}
@@ -308,7 +319,8 @@ void tls_destroy_cfg(void)
  */
 char *tls_domain_str(tls_domain_t *d)
 {
-	static char buf[1024];
+	/* per thread: mode 2 completes the TLS init on tcp reactor pool threads */
+	static _Thread_local char buf[1024];
 	char *p;
 
 	buf[0] = '\0';
@@ -429,6 +441,11 @@ static int ksr_tls_fill_missing(tls_domain_t *d, tls_domain_t *parent)
 		d->verify_client = parent->verify_client;
 	LOG(L_INFO, "%s: verify_client=%d\n", tls_domain_str(d), d->verify_client);
 
+	if(d->verify_server_name == -1)
+		d->verify_server_name = parent->verify_server_name;
+	LOG(L_INFO, "%s: verify_server_name=%d\n", tls_domain_str(d),
+			d->verify_server_name);
+
 	return 0;
 }
 
@@ -457,7 +474,7 @@ static int tls_domain_foreach_CTX(
 	int i, ret;
 	int procs_no;
 
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	for(i = 0; i < procs_no; i++) {
 		if((ret = ctx_cbk(d->ctx[i], l1, p2)) < 0)
 			return ret;
@@ -604,7 +621,7 @@ static int load_cert(tls_domain_t *d)
 	}
 	if(fix_shm_pathname(&d->cert_file) < 0)
 		return -1;
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	for(i = 0; i < procs_no; i++) {
 		if(!SSL_CTX_use_certificate_chain_file(d->ctx[i], d->cert_file.s)) {
 			ERR("%s: Unable to load certificate file '%s'\n", tls_domain_str(d),
@@ -651,7 +668,7 @@ static int load_ca_list(tls_domain_t *d)
 		return -1;
 	if(d->ca_path.s && d->ca_path.len > 0 && fix_shm_pathname(&d->ca_path) < 0)
 		return -1;
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	for(i = 0; i < procs_no; i++) {
 		if(SSL_CTX_load_verify_locations(d->ctx[i], d->ca_file.s, d->ca_path.s)
 				!= 1) {
@@ -696,7 +713,7 @@ static int load_crl(tls_domain_t *d)
 		return -1;
 	LOG(L_INFO, "%s: Certificate revocation lists will be checked (%.*s)\n",
 			tls_domain_str(d), d->crl_file.len, d->crl_file.s);
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	for(i = 0; i < procs_no; i++) {
 		if(SSL_CTX_load_verify_locations(d->ctx[i], d->crl_file.s, 0) != 1) {
 			ERR("%s: Unable to load certificate revocation list '%s'\n",
@@ -752,9 +769,9 @@ static int set_cipher_list(tls_domain_t *d)
 #endif /* TLS_KSSL_WORKAROUND */
 	if(!cipher_list)
 		return 0;
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	for(i = 0; i < procs_no; i++) {
-#if OPENSSL_VERSION_NUMBER < 0x030000000L
+#if OPENSSL_VERSION_NUMBER < 0x010101000L
 		if(SSL_CTX_set_cipher_list(d->ctx[i], cipher_list) == 0) {
 			ERR("%s: Failure to set SSL context cipher list \"%s\"\n",
 					tls_domain_str(d), cipher_list);
@@ -827,7 +844,7 @@ static int set_verification(tls_domain_t *d)
 		}
 	}
 
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	for(i = 0; i < procs_no; i++) {
 		if(d->verify_client >= TLS_VERIFY_CLIENT_OPTIONAL_NO_CA) {
 			/* Note that actual verification result is available in $tls_peer_verified */
@@ -844,7 +861,9 @@ static int set_verification(tls_domain_t *d)
 
 /* This callback function is executed when libssl processes the SSL
  * handshake and does SSL record layer stuff. It's used to trap
- * client-initiated renegotiations.
+ * client-initiated renegotiations (when renegotiation is disabled) and to
+ * refresh the cached ssl metadata (peer certificate, verify result, cipher,
+ * ...) once an allowed renegotiation is completed.
  */
 
 static void sr_ssl_ctx_info_callback(const SSL *ssl, int event, int ret)
@@ -852,24 +871,32 @@ static void sr_ssl_ctx_info_callback(const SSL *ssl, int event, int ret)
 	struct tls_extra_data *data = 0;
 	int tls_dbg;
 
+	if(!(event & (SSL_CB_HANDSHAKE_START | SSL_CB_HANDSHAKE_DONE)))
+		return;
+	data = (struct tls_extra_data *)SSL_get_app_data(ssl);
+	if(data == 0)
+		return; /* not (yet) a connection of this module */
+
 	if(event & SSL_CB_HANDSHAKE_START) {
 		tls_dbg = cfg_get(tls, tls_cfg, debug);
 		LOG(tls_dbg, "SSL handshake started\n");
-		if(data == 0)
-			data = (struct tls_extra_data *)SSL_get_app_data(ssl);
-		if(data->flags & F_TLS_CON_HANDSHAKED) {
+		if((data->flags & F_TLS_CON_HANDSHAKED) && sr_tls_renegotiation == 0) {
 			LOG(tls_dbg, "SSL renegotiation initiated by client\n");
 			data->flags |= F_TLS_CON_RENEGOTIATION;
 		}
 	}
 	if(event & SSL_CB_HANDSHAKE_DONE) {
 		tls_dbg = cfg_get(tls, tls_cfg, debug);
-		if(data == 0)
-			data = (struct tls_extra_data *)SSL_get_app_data(ssl);
 		LOG(tls_dbg, "SSL handshake done\n");
+		if((data->flags & F_TLS_CON_HANDSHAKED) && sr_tls_renegotiation != 0) {
+			/* allowed renegotiation completed: the values cached at the end
+			 * of the initial handshake (tls_accept()/tls_connect()) are stale */
+			LOG(tls_dbg, "SSL renegotiation done - refreshing ssl cache\n");
+			tls_refresh_ssl_cache(data);
+		}
 #if OPENSSL_VERSION_NUMBER < 0x010100000L
 		/* CVE-2009-3555 - disable renegotiation */
-		if(ssl->s3) {
+		if(sr_tls_renegotiation == 0 && ssl->s3) {
 			LOG(tls_dbg, "SSL disable renegotiation\n");
 			ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
 		}
@@ -888,17 +915,17 @@ static int set_ssl_options(tls_domain_t *d)
 	int i;
 	int procs_no;
 	long options;
-#if OPENSSL_VERSION_NUMBER >= 0x00908000L
+#if OPENSSL_VERSION_NUMBER >= 0x00908000L && !defined(OPENSSL_IS_AWSLC)
 	long ssl_version;
 	STACK_OF(SSL_COMP) * comp_methods;
 #endif
 
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	options = SSL_OP_ALL; /* all the bug workarounds by default */
 #if OPENSSL_VERSION_NUMBER >= 0x00907000L
 	options |= SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION
 			   | SSL_OP_CIPHER_SERVER_PREFERENCE;
-#if OPENSSL_VERSION_NUMBER >= 0x00908000L
+#if OPENSSL_VERSION_NUMBER >= 0x00908000L && !defined(OPENSSL_IS_AWSLC)
 	ssl_version = SSLeay();
 	if((ssl_version >= 0x0090800L) && (ssl_version < 0x0090803fL)) {
 		/* if 0.9.8 <= openssl version < 0.9.8c and compression support is
@@ -926,8 +953,9 @@ static int set_ssl_options(tls_domain_t *d)
 #endif
 	for(i = 0; i < procs_no; i++) {
 		SSL_CTX_set_options(d->ctx[i], options);
-		if(sr_tls_renegotiation == 0)
-			SSL_CTX_set_info_callback(d->ctx[i], sr_ssl_ctx_info_callback);
+		/* always needed: blocks client renegotiations when disabled,
+		 * refreshes the ssl cache after a renegotiation when enabled */
+		SSL_CTX_set_info_callback(d->ctx[i], sr_ssl_ctx_info_callback);
 	}
 	return 0;
 }
@@ -944,7 +972,7 @@ static int set_session_cache(tls_domain_t *d)
 	int procs_no;
 	str tls_session_id;
 
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	tls_session_id = cfg_get(tls, tls_cfg, session_id);
 	for(i = 0; i < procs_no; i++) {
 		/* janakj: I am not sure if session cache makes sense in ser, session
@@ -983,6 +1011,7 @@ static int tls_ssl_ctx_mode(SSL_CTX *ctx, long mode, void *clear)
 }
 
 
+#ifndef OPENSSL_NO_BUF_FREELISTS
 /**
  * @brief TLS set ctx->free_list_max_len
  * @param ctx TLS context
@@ -1005,6 +1034,7 @@ static int tls_ssl_ctx_set_freelist(SSL_CTX *ctx, long val, void *unused)
 #endif
 	return 0;
 }
+#endif
 
 /**
  * @brief TLS SSL_CTX_set_max_send_fragment wrapper
@@ -1080,12 +1110,9 @@ static int tls_server_name_cb(SSL *ssl, int *ad, void *private)
 		   " socket [%s:%d] server name='%s' -"
 		   " switching SSL CTX to %p dom %p%s\n",
 			server_name.s, ip_addr2a(&new_domain->ip), new_domain->port,
-			ZSW(new_domain->server_name.s),
-			new_domain->ctx[ksr_tcp_main_threads == 0 ? process_no : 0],
-			new_domain,
+			ZSW(new_domain->server_name.s), DOM_CTX(new_domain), new_domain,
 			(new_domain->type & TLS_DOMAIN_DEF) ? " (default)" : "");
-	SSL_set_SSL_CTX(
-			ssl, new_domain->ctx[ksr_tcp_main_threads == 0 ? process_no : 0]);
+	SSL_set_SSL_CTX(ssl, DOM_CTX(new_domain));
 	/* SSL_set_SSL_CTX only sets the correct certificate parameters, but does
 	   set the proper verify options. Thus this will be done manually! */
 
@@ -1107,9 +1134,89 @@ static int tls_server_name_cb(SSL *ssl, int *ad, void *private)
 }
 #endif
 
+/**
+ * write a comment line with the connection and handshake parameters before
+ * a key line (keylog_mode value 32: 1 << 5, KSR_TLS_KEYLOG_MODE_TUPLE), so
+ * a capture that missed the hellos can match the keys to a flow and derive
+ * the record keys (tls 1.2: server random + cipher suite, tls 1.3: cipher
+ * suite)
+ */
+static void ksr_tls_keylog_emit_tuple(const SSL *ssl)
+{
+	struct tls_extra_data *data;
+	struct tcp_connection *c;
+	const SSL_CIPHER *cipher;
+	struct sockaddr_storage sa;
+	socklen_t sa_len;
+	char src_ip[IP_ADDR_MAX_STR_SIZE + 2];
+	char dst_ip[IP_ADDR_MAX_STR_SIZE + 2];
+	char sr_hex[SSL3_RANDOM_SIZE * 2 + 1];
+	unsigned char sr[SSL3_RANDOM_SIZE];
+	char buf[512];
+	unsigned int dst_port;
+	size_t sr_len;
+	size_t i;
+	int fd;
+	int n;
+
+	data = (struct tls_extra_data *)SSL_get_app_data(ssl);
+	if(data == NULL || data->tcp_conn == NULL) {
+		return;
+	}
+	c = data->tcp_conn;
+	/* own buffers (ip_addr2a() uses one static buffer); ipv6 as [addr] */
+	if(ip_addr2sbufz(&c->rcv.src_ip, src_ip, sizeof(src_ip)) <= 0
+			|| ip_addr2sbufz(&c->rcv.dst_ip, dst_ip, sizeof(dst_ip)) <= 0) {
+		return;
+	}
+
+	dst_port = c->rcv.dst_port;
+	if(!(c->flags & F_CONN_PASSIVE)) {
+		/* outbound: read the local port from the socket of this process
+		 * (c->s in tcp main, c->fd in a worker) */
+		fd = _tconfd(c);
+		sa_len = sizeof(sa);
+		if(fd >= 0 && getsockname(fd, (struct sockaddr *)&sa, &sa_len) == 0) {
+			if(sa.ss_family == AF_INET) {
+				dst_port = ntohs(((struct sockaddr_in *)&sa)->sin_port);
+			} else if(sa.ss_family == AF_INET6) {
+				dst_port = ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
+			}
+		}
+	} else if(dst_port == 0 && c->rcv.bind_address != NULL) {
+		dst_port = c->rcv.bind_address->port_no;
+	}
+
+	sr_len = SSL_get_server_random(ssl, sr, sizeof(sr));
+	for(i = 0; i < sr_len; i++) {
+		snprintf(sr_hex + i * 2, 3, "%02x", sr[i]);
+	}
+	sr_hex[sr_len * 2] = '\0';
+	cipher = SSL_get_current_cipher(ssl);
+
+	n = snprintf(buf, sizeof(buf),
+			"# TUPLE src=%s:%u dst=%s:%u sr=%s cs=%04x v=%04x", src_ip,
+			(unsigned)c->rcv.src_port, dst_ip, dst_port, sr_hex,
+			cipher ? (unsigned)(SSL_CIPHER_get_id(cipher) & 0xFFFF) : 0,
+			(unsigned)SSL_version(ssl));
+	if(n <= 0 || (size_t)n >= sizeof(buf)) {
+		return;
+	}
+	if(*ksr_tls_keylog_mode & KSR_TLS_KEYLOG_MODE_MLOG) {
+		LM_NOTICE("tlskeylog: %s\n", buf);
+	}
+	ksr_tls_keylog_file_write(ssl, buf);
+	ksr_tls_keylog_peer_send(ssl, buf);
+}
+
 static void ksr_tls_keylog_callback(const SSL *ssl, const char *line)
 {
 	if(ksr_tls_keylog_mode == NULL) {
+		return;
+	}
+	/* an LD_PRELOAD key logger can chain other libraries' sessions here
+	 * (e.g. libpq's, whose app data is not a tls_extra_data) */
+	if(SSL_get_ex_data(ssl, ksr_tls_ssl_ex_idx) == NULL) {
 		return;
 	}
 	if(!(*ksr_tls_keylog_mode & KSR_TLS_KEYLOG_MODE_ACTIVE)) {
@@ -1119,6 +1226,9 @@ static void ksr_tls_keylog_callback(const SSL *ssl, const char *line)
 		if(ksr_tls_keylog_vfilter_match(line) == 0) {
 			return;
 		}
+	}
+	if(*ksr_tls_keylog_mode & KSR_TLS_KEYLOG_MODE_TUPLE) {
+		ksr_tls_keylog_emit_tuple(ssl);
 	}
 	if(*ksr_tls_keylog_mode & KSR_TLS_KEYLOG_MODE_MLOG) {
 		LM_NOTICE("tlskeylog: %s\n", line);
@@ -1140,6 +1250,23 @@ static int ksr_tls_fix_domain(tls_domain_t *d, tls_domain_t *def)
 	if(ksr_tls_fill_missing(d, def) < 0)
 		return -1;
 
+	if(d->verify_server_name > 0) {
+#ifndef KSR_TLS_VERIFY_SERVER_NAME
+		LM_ERR("%s: verify_server_name requires OpenSSL 1.1.0 or newer\n",
+				tls_domain_str(d));
+		return -1;
+#endif
+		if(d->type & TLS_DOMAIN_SRV) {
+			LM_WARN("%s: verify_server_name is only used by client profiles"
+					" - ignored\n",
+					tls_domain_str(d));
+		} else if(d->verify_cert <= 0) {
+			LM_WARN("%s: verify_server_name is used only with"
+					" verify_certificate enabled - ignored\n",
+					tls_domain_str(d));
+		}
+	}
+
 	if(d->type & TLS_DOMAIN_ANY) {
 		if(d->server_name.s == NULL || d->server_name.len < 0) {
 			LM_ERR("%s: tls domain for any address but no server name\n",
@@ -1148,7 +1275,7 @@ static int ksr_tls_fix_domain(tls_domain_t *d, tls_domain_t *def)
 		}
 	}
 
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	d->ctx = (SSL_CTX **)shm_malloc(sizeof(SSL_CTX *) * procs_no);
 	if(!d->ctx) {
 		ERR("%s: Cannot allocate shared memory\n", tls_domain_str(d));
@@ -1329,7 +1456,10 @@ static int ksr_passwd_cfg_cb2(char *buf, int size, int rwflag, void *tlsd)
  */
 static int ksr_passwd_ui_cb(char *buf, int size, int rwflag, void *filename)
 {
-#if OPENSSL_VERSION_NUMBER >= 0x00907000L
+#if defined(OPENSSL_IS_AWSLC)
+	ERR("aws-lc: no passphrase prompt, set private_key_password\n");
+	return 0;
+#elif OPENSSL_VERSION_NUMBER >= 0x00907000L
 	UI *ui;
 	const char *prompt;
 
@@ -1386,7 +1516,7 @@ static int load_engine_private_key(tls_domain_t *d)
 		return 0;
 
 	do {
-		i = (ksr_tcp_main_threads == 0 ? process_no : 0);
+		i = TLS_CTX_IDX();
 		for(idx = 0, ret_pwd = 0; idx < 3; idx++) {
 			pkey = tls_engine_private_key(d->pkey_file.s + KEY_PREFIX_LEN);
 			if(pkey) {
@@ -1441,8 +1571,17 @@ static int load_private_key(tls_domain_t *d)
 	}
 	if(fix_shm_pathname(&d->pkey_file) < 0)
 		return -1;
+#ifdef KSR_SSL_COMMON
+	if(ksr_tcp_main_threads == 0
+			&& strncmp(d->pkey_file.s, KEY_PREFIX, KEY_PREFIX_LEN) == 0) {
+		ERR("%s: engine/provider key '%s' requires tcp_main_threads = 1 or"
+			" 2\n",
+				tls_domain_str(d), d->pkey_file.s);
+		return -1;
+	}
+#endif /* KSR_SSL_COMMON */
 
-	procs_no = ksr_tcp_main_threads == 0 ? get_max_procs() : 1;
+	procs_no = TLS_CTX_NO();
 	for(i = 0; i < procs_no; i++) {
 		if(ksr_tls_key_password_mode == 1) {
 			SSL_CTX_set_default_passwd_cb(d->ctx[i], ksr_passwd_ui_cb);
@@ -1454,8 +1593,8 @@ static int load_private_key(tls_domain_t *d)
 
 		for(idx = 0, ret_pwd = 0; idx < 3; idx++) {
 #ifdef KSR_SSL_COMMON
-			// in PROC_INIT skip loading HSM keys due to
-			// fork() issues with PKCS#11 libraries
+			/* engine/provider keys: loaded in PROC_TCP_MAIN by
+			 * tls_fix_engine_keys() (PKCS#11 modules break across fork) */
 			if(strncmp(d->pkey_file.s, KEY_PREFIX, KEY_PREFIX_LEN) != 0) {
 				ret_pwd = SSL_CTX_use_PrivateKey_file(
 						d->ctx[i], d->pkey_file.s, SSL_FILETYPE_PEM);

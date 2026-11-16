@@ -111,6 +111,7 @@ static tls_domain_t mod_params = {
 		0,								 /* Server name (SNI) mode */
 		{0, 0},							 /* Server id */
 		TLS_VERIFY_CLIENT_OFF,			 /* Verify client */
+		0,								 /* Verify server name */
 		0								 /* next */
 };
 
@@ -137,6 +138,7 @@ tls_domain_t srv_defaults = {
 		0,								 /* Server name (SNI) mode */
 		{0, 0},							 /* Server id */
 		TLS_VERIFY_CLIENT_OFF,			 /* Verify client */
+		0,								 /* Verify server name */
 		0								 /* next */
 };
 
@@ -163,6 +165,7 @@ tls_domain_t cli_defaults = {
 		0,								 /* Server name (SNI) mode */
 		{0, 0},							 /* Server id */
 		TLS_VERIFY_CLIENT_OFF,			 /* Verify client */
+		0,								 /* Verify server name */
 		0								 /* next */
 };
 
@@ -261,6 +264,8 @@ static struct tls_hooks tls_h = {
 		tls_h_mod_pre_init_f,
 		tls_h_match_domain_f,
 		tls_h_match_connections_domain_f,
+		NULL, /* run_event_route */
+		tls_h_connect_info_f,
 };
 
 
@@ -361,9 +366,7 @@ static int mod_init(void)
 #ifndef OPENSSL_NO_DH
 	LM_INFO("With Diffie Hellman\n");
 #endif
-	if(sr_tls_event_callback.s == NULL || sr_tls_event_callback.len <= 0) {
-		tls_lookup_event_routes();
-	}
+
 	return 0;
 error:
 	tls_h_mod_destroy_f();
@@ -386,6 +389,7 @@ static int mod_child_hook(int rank)
 }
 
 
+int wolfssl_child_rank = -1;
 static int mod_child(int rank)
 {
 	if(tls_disable || (tls_domains_cfg == 0))
@@ -393,20 +397,17 @@ static int mod_child(int rank)
 
 	/* fix tls config only from the main proc/PROC_INIT., when we know
 	 * the exact process number and before any other process starts*/
-	if(rank == PROC_INIT && ksr_tcp_main_threads == 0) {
-		return mod_child_hook(rank);
-	}
-	if(rank == PROC_TCP_MAIN && ksr_tcp_main_threads > 0) {
+	wolfssl_child_rank = rank;
+
+	if(rank == PROC_TCP_MAIN) {
 		if(mod_child_hook(rank) < 0) {
 			LM_ERR("failed to fix TLS configuration in TCP main thread\n");
 			return -1;
 		}
-		// fall-through to PKCS#11
 	}
 
 
-	if((rank > 0 && ksr_tcp_main_threads == 0)
-			|| (rank == PROC_TCP_MAIN && ksr_tcp_main_threads > 0)) {
+	if(rank == PROC_TCP_MAIN) {
 		if(tls_load_pkcs11_keys(*tls_domains_cfg, &srv_defaults, &cli_defaults)
 				< 0) {
 			LM_ERR("failed to load PKCS#11 keys in child process\n");
@@ -447,14 +448,14 @@ static int ki_is_peer_verified(sip_msg_t *msg)
 
 	if(c->type != PROTO_TLS) {
 		LM_ERR("Connection found but is not TLS\n");
-		tcpconn_put(c);
+		tcpconn_chld_put(c);
 		return -1;
 	}
 
 	if(!c->extra_data) {
 		LM_ERR("no extra_data specified in TLS/TCP connection found."
 			   " This should not happen... return -1\n");
-		tcpconn_put(c);
+		tcpconn_chld_put(c);
 		return -1;
 	}
 
@@ -464,7 +465,7 @@ static int ki_is_peer_verified(sip_msg_t *msg)
 	// WOLFSSL_X509_V_OK / X509_V_OK
 	if(ssl_verify != 0) {
 		LM_WARN("verification of presented certificate failed... return -1\n");
-		tcpconn_put(c);
+		tcpconn_chld_put(c);
 		return -1;
 	}
 
@@ -474,11 +475,11 @@ static int ki_is_peer_verified(sip_msg_t *msg)
 	if(!tls_c->ssl_peer_cert) {
 		LM_INFO("tlsops:is_peer_verified: WARNING: peer did not present "
 				"a certificate. Thus it could not be verified... return -1\n");
-		tcpconn_put(c);
+		tcpconn_chld_put(c);
 		return -1;
 	}
 
-	tcpconn_put(c);
+	tcpconn_chld_put(c);
 
 	LM_DBG("tlsops:is_peer_verified: peer is successfully verified"
 		   "...done\n");

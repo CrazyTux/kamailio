@@ -83,6 +83,7 @@ struct cfg_group_core default_core_cfg = {
 		-1, /*!< dns_retr_no */
 		-1, /*!< dns_servers_no */
 		1,	/*!< dns_search_list */
+		0,	/*!< dns_query_absolute */
 		1,	/*!< dns_search_fmatch */
 		0,	/*!< dns_reinit */
 		1,	/*!< dns_naptr_ignore_rfc */
@@ -98,6 +99,7 @@ struct cfg_group_core default_core_cfg = {
 		DEFAULT_DNS_MAX_MEM,	   /*!< dns_cache_max_mem */
 		0, /*!< dns_cache_del_nonexp -- delete only expired entries by default */
 		0, /*!< dns_cache_rec_pref -- 0 by default, do not check the existing entries. */
+		0, /*!< dns_cache_mode -- 0 by default. */
 #endif
 #ifdef PKG_MALLOC
 		0, /*!< mem_dump_pkg */
@@ -237,6 +239,10 @@ cfg_def_t core_cfg_def[] = {
 				"/etc/resolv.conf will be used"},
 		{"dns_use_search_list", CFG_VAR_INT, 0, 1, 0, resolv_reinit,
 				"if set to 0, the search list in /etc/resolv.conf is ignored"},
+		{"dns_query_absolute", CFG_VAR_INT, 0, 1, 0, 0,
+				"append the root dot to DNS query names when the search list "
+				"is "
+				"disabled"},
 		{"dns_search_full_match", CFG_VAR_INT, 0, 1, 0, 0,
 				"enable/disable domain name checks against the search list "
 				"in DNS answers"},
@@ -278,6 +284,8 @@ cfg_def_t core_cfg_def[] = {
 				" 1 - prefer old records"
 				" 2 - prefer new records"
 				" 3 - prefer records with longer lifetime"},
+		{"dns_cache_mode", CFG_VAR_INT, 0, 0, 0, 0,
+				"dns cache mode - controls the dns cache management"},
 #endif
 #ifdef PKG_MALLOC
 		{"mem_dump_pkg", CFG_VAR_INT, 0, 0, 0, mem_dump_pkg_cb,

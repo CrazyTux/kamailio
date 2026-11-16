@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include "../../core/tcp_conn.h"
 #include "../../core/tcp_read.h"
+#include "../../core/locking.h"
 #include "tls_domain.h"
 #include "tls_ct_wrq.h"
 
@@ -66,10 +67,14 @@ typedef struct tls_extra_data
 	struct tls_rd_buf *enc_rd_buf;
 	unsigned int flags;
 	enum tls_conn_states state;
+	int run_conn_out_pending; /* tcp_main_threads>0: tls:connection-out should not
+							   * run on a PROC_TCP_MAIN mtops thread; this flag
+							   * marks deferred execution */
+	struct tcp_connection *tcp_conn; /* keylog tuple (memory bio, no fd) */
 
 	char *ssl_servername;
 	char *ssl_cipher_name;
-	char ssl_cipher_desc[128];
+	char ssl_cipher_desc[256];
 	char ssl_version[32];
 	int ssl_cipher_bits;
 	long ssl_verify_result;
@@ -81,8 +86,21 @@ typedef struct tls_extra_data
 
 	unsigned char *ssl_cert_chain;
 	int ssl_cert_chain_len;
+
+	/* protects the ssl_* cached fields above: they are rebuilt after a
+	 * renegotiation by the process owning the SSL*, while other processes
+	 * (or tcp_main threads) may be reading them */
+	gen_lock_t cache_lock;
 } tls_extra_data_t;
 
+#define tls_ssl_cache_lock(ed) lock_get(&(ed)->cache_lock)
+#define tls_ssl_cache_unlock(ed) lock_release(&(ed)->cache_lock)
+
+void tls_refresh_ssl_cache(struct tls_extra_data *data);
+
+/* SSL ex_data slot marking the SSLs of this module (value: their
+ * tls_extra_data) */
+extern int ksr_tls_ssl_ex_idx;
 
 /* return true if write wants read */
 #define tls_write_wants_read(tls_ed) (tls_ed->flags & F_TLS_CON_WR_WANTS_RD)
@@ -122,6 +140,8 @@ int tls_connect(struct tcp_connection *c, int *error);
 int tls_accept(struct tcp_connection *c, int *error);
 
 void tls_lookup_event_routes(void);
+int tls_run_event_routes(struct tcp_connection *c);
+void tls_h_connect_info_f(ksr_coninfo_t *ci);
 int ksr_tls_set_connect_server_id(str *srvid);
 
 #endif /* _TLS_SERVER_H */

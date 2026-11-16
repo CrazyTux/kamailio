@@ -66,6 +66,8 @@
 	#define IFDEF_SKIP_S            15
 	#define DEFINE_DATA_S           16
 	#define EVRT_NAME_S             17
+	#define UNDEF_S                 18
+	#define UNDEF_EOL_S             19
 
 	#define STR_BUF_ALLOC_UNIT	128
 	struct str_buf{
@@ -119,6 +121,21 @@
 		struct sr_yy_fname *next;
 	} *sr_yy_fname_list = 0;
 
+    /* define/ifdef support */
+    #define MAX_DEFINES    512
+    static ksr_ppdefine_t pp_defines[MAX_DEFINES];
+    static int pp_num_defines = 0;
+    static int pp_define_type = 0;
+    static int pp_define_index = -1;
+
+    /* pp_ifdef_stack[i] is 1 if the ifdef test at depth i is either
+     * ifdef(defined), ifndef(undefined), or the opposite of these
+     * two, but in an else branch
+     */
+    #define MAX_IFDEFS    512
+    static int pp_ifdef_stack[MAX_IFDEFS];
+    static int pp_sptr = 0; /* stack pointer */
+
 	static int  pp_ifdef_type(int pos);
 	static void pp_ifdef_var(int len, const char * text);
 	static void pp_ifdef();
@@ -132,8 +149,8 @@
 /* start conditions */
 %x STRING1 STRING2 STR_BETWEEN COMMENT COMMENT_LN ATTR SELECT AVP_PVAR PVAR_P
 %x PVARID INCLF IMPTF EVRTNAME CFGPRINTMODE CFGPRINTLOADMOD DEFENV_ID DEFENVS_ID
-%x TRYDEFENV_ID TRYDEFENVS_ID LINECOMMENT DEFINE_ID DEFINE_EOL DEFINE_DATA
-%x IFDEF_ID IFDEF_EOL IFDEF_SKIP IFEXP_STM
+%x TRYDEFENV_ID TRYDEFENVS_ID LINECOMMENT DEFINE_ID UNDEF_ID DEFINE_EOL
+%x UNDEF_EOL DEFINE_DATA IFDEF_ID IFDEF_EOL IFDEF_SKIP IFEXP_STM
 
 /* config script types : #!SER  or #!KAMAILIO or #!MAX_COMPAT */
 SER_CFG			SER
@@ -165,6 +182,7 @@ EXEC	exec
 FORCE_RPORT		"force_rport"|"add_rport"
 LOCAL_RPORT		"local_rport"
 ADD_LOCAL_RPORT		"add_local_rport"
+VIA_CONID_MODE	"via_conid_mode"
 FORCE_TCP_ALIAS		"force_tcp_alias"|"add_tcp_alias"
 UDP_MTU		"udp_mtu"
 UDP_MTU_TRY_PROTO	"udp_mtu_try_proto"
@@ -333,6 +351,7 @@ DNS_SLOW_QUERY_MS	dns_slow_query_ms
 DNS_RETR_NO		dns_retr_no
 DNS_SERVERS_NO	dns_servers_no
 DNS_USE_SEARCH	dns_use_search_list
+DNS_QUERY_ABSOLUTE	dns_query_absolute
 DNS_SEARCH_FMATCH	dns_search_full_match
 DNS_NAPTR_IGNORE_RFC	dns_naptr_ignore_rfc
 /* dns cache */
@@ -347,6 +366,8 @@ DNS_CACHE_MEM		dns_cache_mem
 DNS_CACHE_GC_INT	dns_cache_gc_interval
 DNS_CACHE_DEL_NONEXP	dns_cache_del_nonexp|dns_cache_delete_nonexpired
 DNS_CACHE_REC_PREF	dns_cache_rec_pref
+DNS_CACHE_MODE		dns_cache_mode
+
 /* ipv6 auto bind */
 AUTO_BIND_IPV6		auto_bind_ipv6
 BIND_IPV6_LINK_LOCAL	bind_ipv6_link_local
@@ -378,6 +399,7 @@ TCP_MSG_READ_TIMEOUT tcp_msg_read_timeout
 TCP_MSG_DATA_TIMEOUT tcp_msg_data_timeout
 TCP_ACCEPT_IPLIMIT tcp_accept_iplimit
 TCP_MAIN_THREADS tcp_main_threads
+TCP_REACTOR_THREADS tcp_reactor_threads
 TCP_CHECK_TIMER tcp_check_timer
 CHILDREN children
 SOCKET socket
@@ -526,6 +548,8 @@ LATENCY_LIMIT_ACTION	latency_limit_action
 LATENCY_LIMIT_CFG		latency_limit_cfg
 
 RPC_EXEC_DELTA_CFG		"rpc_exec_delta"
+RPC_EXEC_LOCKS_CFG		"rpc_exec_locks"
+RPC_EXEC_LOCKS_MODE_CFG		"rpc_exec_locks_mode"
 
 URI_HOST_EXTRA_CHARS	"uri_host_extra_chars"
 HDR_NAME_EXTRA_CHARS	"hdr_name_extra_chars"
@@ -603,6 +627,8 @@ IFEXP        ifexp
 ENDIF        endif
 TRYDEF       "trydefine"|"trydef"
 REDEF        "redefine"|"redef"
+UNDEF        "undefine"|"undef"
+TRYUNDEF     "tryundefine"|"tryundef"
 DEFEXP       defexp
 DEFEXPS      defexps
 DEFENV       defenv
@@ -702,6 +728,8 @@ IMPORTFILE      "import_file"
 								return LOCAL_RPORT; }
 <INITIAL>{ADD_LOCAL_RPORT}	{ count(); yylval.strval=yytext;
 								return ADD_LOCAL_RPORT; }
+<INITIAL>{VIA_CONID_MODE}	{ count(); yylval.strval=yytext;
+								return VIA_CONID_MODE; }
 <INITIAL>{FORCE_TCP_ALIAS}	{ count(); yylval.strval=yytext;
 								return FORCE_TCP_ALIAS; }
 <INITIAL>{UDP_MTU}	{ count(); yylval.strval=yytext; return UDP_MTU; }
@@ -819,6 +847,8 @@ IMPORTFILE      "import_file"
 								return DNS_SERVERS_NO; }
 <INITIAL>{DNS_USE_SEARCH}	{ count(); yylval.strval=yytext;
 								return DNS_USE_SEARCH; }
+<INITIAL>{DNS_QUERY_ABSOLUTE}	{ count(); yylval.strval=yytext;
+								return DNS_QUERY_ABSOLUTE; }
 <INITIAL>{DNS_SEARCH_FMATCH}	{ count(); yylval.strval=yytext;
 								return DNS_SEARCH_FMATCH; }
 <INITIAL>{DNS_NAPTR_IGNORE_RFC}	{ count(); yylval.strval=yytext;
@@ -845,6 +875,8 @@ IMPORTFILE      "import_file"
 								return DNS_CACHE_DEL_NONEXP; }
 <INITIAL>{DNS_CACHE_REC_PREF}	{ count(); yylval.strval=yytext;
 								return DNS_CACHE_REC_PREF; }
+<INITIAL>{DNS_CACHE_MODE}	{ count(); yylval.strval=yytext;
+								return DNS_CACHE_MODE; }
 <INITIAL>{AUTO_BIND_IPV6}	{ count(); yylval.strval=yytext;
 								return AUTO_BIND_IPV6; }
 <INITIAL>{BIND_IPV6_LINK_LOCAL}	{ count(); yylval.strval=yytext;
@@ -883,6 +915,7 @@ IMPORTFILE      "import_file"
 <INITIAL>{TCP_MSG_DATA_TIMEOUT}	{ count(); yylval.strval=yytext; return TCP_MSG_DATA_TIMEOUT; }
 <INITIAL>{TCP_ACCEPT_IPLIMIT}	{ count(); yylval.strval=yytext; return TCP_ACCEPT_IPLIMIT; }
 <INITIAL>{TCP_MAIN_THREADS}	{ count(); yylval.strval=yytext; return TCP_MAIN_THREADS; }
+<INITIAL>{TCP_REACTOR_THREADS}	{ count(); yylval.strval=yytext; return TCP_REACTOR_THREADS; }
 <INITIAL>{TCP_CHECK_TIMER}	{ count(); yylval.strval=yytext; return TCP_CHECK_TIMER; }
 <INITIAL>{CHILDREN}	{ count(); yylval.strval=yytext; return CHILDREN; }
 <INITIAL>{SOCKET}	{ count(); yylval.strval=yytext; return SOCKET; }
@@ -1095,6 +1128,8 @@ IMPORTFILE      "import_file"
 <INITIAL>{LATENCY_LIMIT_ACTION}  { count(); yylval.strval=yytext; return LATENCY_LIMIT_ACTION;}
 <INITIAL>{LATENCY_LIMIT_CFG}  { count(); yylval.strval=yytext; return LATENCY_LIMIT_CFG;}
 <INITIAL>{RPC_EXEC_DELTA_CFG}  { count(); yylval.strval=yytext; return RPC_EXEC_DELTA_CFG;}
+<INITIAL>{RPC_EXEC_LOCKS_CFG}  { count(); yylval.strval=yytext; return RPC_EXEC_LOCKS_CFG;}
+<INITIAL>{RPC_EXEC_LOCKS_MODE_CFG}  { count(); yylval.strval=yytext; return RPC_EXEC_LOCKS_MODE_CFG;}
 <INITIAL>{CFG_DESCRIPTION}	{ count(); yylval.strval=yytext; return CFG_DESCRIPTION; }
 <INITIAL>{LOADMODULE}	{ count(); yylval.strval=yytext; return LOADMODULE; }
 <INITIAL>{LOADMODULEX}	{ count(); yylval.strval=yytext; return LOADMODULEX; }
@@ -1397,6 +1432,14 @@ IMPORTFILE      "import_file"
 											ksr_cfg_print_part(yytext);
 											pp_define_set_type(KSR_PPDEF_REDEF);
 											state = DEFINE_S; BEGIN(DEFINE_ID); }
+<INITIAL,CFGPRINTMODE>{PREP_START}{UNDEF}{EAT_ABLE}+	{	count();
+											ksr_cfg_print_part(yytext);
+											pp_define_set_type(KSR_PPDEF_UNDEF);
+											state = UNDEF_S; BEGIN(UNDEF_ID); }
+<INITIAL,CFGPRINTMODE>{PREP_START}{TRYUNDEF}{EAT_ABLE}+	{	count();
+											ksr_cfg_print_part(yytext);
+											pp_define_set_type(KSR_PPDEF_TRYUNDEF);
+											state = UNDEF_S; BEGIN(UNDEF_ID); }
 <INITIAL,CFGPRINTMODE>{PREP_START}{DEFEXP}{EAT_ABLE}+	{	count();
 											ksr_cfg_print_part(yytext);
 											pp_define_set_type(KSR_PPDEF_DEFEXP);
@@ -1437,6 +1480,31 @@ IMPORTFILE      "import_file"
 <DEFINE_DATA>.          {	count();
 							ksr_cfg_print_part(yytext);
 							addstr(&s_buf, yytext, yyleng); }
+<UNDEF_ID>{ID}{MINUS}           {	count();
+									ksr_cfg_print_part(yytext);
+									LM_CRIT(
+										"error at %s line %d: '-' not allowed\n",
+										(finame)?finame:"cfg", line);
+									ksr_exit(-1);
+								}
+<UNDEF_ID>{ID}                  {	count();
+									ksr_cfg_print_part(yytext);
+									if (pp_undefine(yyleng, yytext)) return 1;
+									state = UNDEF_EOL_S; BEGIN(UNDEF_EOL); }
+<UNDEF_EOL>{EAT_ABLE}           {	count(); ksr_cfg_print_part(yytext); }
+<UNDEF_EOL>{CR}					{	count();
+									ksr_cfg_print_part(yytext);
+									state = INITIAL_S;
+									ksr_cfg_print_initial_state();
+								}
+<UNDEF_EOL>.					{	count();
+									ksr_cfg_print_part(yytext);
+									LM_CRIT(
+										"error at %s line %d: unexpected character"
+										" after ID in undefine\n",
+										(finame)?finame:"cfg", line);
+									ksr_exit(-1);
+								}
 
 <INITIAL>{PREP_START}{SUBST}	{ count();  return SUBST;}
 <INITIAL>{PREP_START}{SUBSTDEF}	{ count();  return SUBSTDEF;}
@@ -2061,22 +2129,6 @@ static int sr_pop_yy_state()
 	return 0;
 }
 
-/* define/ifdef support */
-
-#define MAX_DEFINES    512
-static ksr_ppdefine_t pp_defines[MAX_DEFINES];
-static int pp_num_defines = 0;
-static int pp_define_type = 0;
-static int pp_define_index = -1;
-
-/* pp_ifdef_stack[i] is 1 if the ifdef test at depth i is either
- * ifdef(defined), ifndef(undefined), or the opposite of these
- * two, but in an else branch
- */
-#define MAX_IFDEFS    512
-static int pp_ifdef_stack[MAX_IFDEFS];
-static int pp_sptr = 0; /* stack pointer */
-
 str* pp_get_define_name(int idx)
 {
 	if(idx<0 || idx>=pp_num_defines)
@@ -2321,6 +2373,50 @@ str *pp_define_get(int len, const char *text)
 		}
 	}
 	return NULL;
+}
+
+int pp_undefine(int len, const char *text)
+{
+	int ppos;
+	int i;
+
+	if(len <= 0 || text == NULL) {
+		LM_ERR("invalid parameters\n");
+		return -1;
+	}
+
+	ppos = pp_lookup(len, text);
+	if(ppos < 0) {
+		if(pp_define_type == KSR_PPDEF_TRYUNDEF) {
+			LM_DBG("ID [%.*s] not defined - ignoring\n", len, text);
+			return 0;
+		} else {
+			LM_CRIT("ID [%.*s] not defined, cannot undefine\n", len, text);
+			return -1;
+		}
+	}
+
+	LM_DBG("undefining ID: %.*s\n", len, text);
+	if(pp_defines[ppos].name.s) {
+		pkg_free(pp_defines[ppos].name.s);
+		pp_defines[ppos].name.len = 0;
+		pp_defines[ppos].name.s = NULL;
+	}
+	if(pp_defines[ppos].value.s) {
+		pkg_free(pp_defines[ppos].value.s);
+		pp_defines[ppos].value.len = 0;
+		pp_defines[ppos].value.s = NULL;
+	}
+
+	/*
+	 * shift remaining elements to maintain contiguous array O(n)
+	 * TODO: consider refactoring pp_defines as a hash table
+	 */
+	for(i = ppos; i < pp_num_defines - 1; i++) {
+		pp_defines[i] = pp_defines[i + 1];
+	}
+	pp_num_defines--;
+	return 0;
 }
 
 static int pp_ifdef_type(int type)

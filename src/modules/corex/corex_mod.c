@@ -52,7 +52,9 @@ MODULE_VERSION
 
 static int nio_intercept = 0;
 static int w_forward_uac(sip_msg_t *msg, char *p1, char *p2);
+static int w_forward_uac_branch(sip_msg_t *msg, char *pbindex, char *p2);
 static int w_forward_uac_uri(sip_msg_t *msg, char *puri, char *p2);
+static int w_forward_uac_uri_branch(sip_msg_t *msg, char *puri, char *pbindex);
 static int w_forward_reply(sip_msg_t *msg, char *p1, char *p2);
 static int w_append_branch(sip_msg_t *msg, char *su, char *sq);
 static int w_send_udp(sip_msg_t *msg, char *su, char *sq);
@@ -69,6 +71,7 @@ static int w_resetxflag(struct sip_msg *msg, char *flag, char *s2);
 static int w_setxflag(struct sip_msg *msg, char *flag, char *s2);
 static int w_set_send_socket(sip_msg_t *msg, char *psock, char *p2);
 static int w_set_send_socket_name(sip_msg_t *msg, char *psock, char *p2);
+static int w_set_send_socket_map(sip_msg_t *msg, char *pmap, char *p2);
 static int w_set_recv_socket(sip_msg_t *msg, char *psock, char *p2);
 static int w_set_recv_socket_name(sip_msg_t *msg, char *psock, char *p2);
 static int w_set_source_address(sip_msg_t *msg, char *paddr, char *p2);
@@ -132,8 +135,12 @@ static tr_export_t mod_trans[] = {
 static cmd_export_t cmds[] = {
 	{"forward_uac", (cmd_function)w_forward_uac, 0,
 		0, 0, REQUEST_ROUTE},
+	{"forward_uac", (cmd_function)w_forward_uac_branch, 1,
+		fixup_igp_null, fixup_free_igp_null, REQUEST_ROUTE},
 	{"forward_uac_uri", (cmd_function)w_forward_uac_uri, 1,
 		fixup_spve_null, fixup_free_spve_null, REQUEST_ROUTE},
+	{"forward_uac_uri", (cmd_function)w_forward_uac_uri_branch, 2,
+		fixup_spve_igp, fixup_free_spve_igp, REQUEST_ROUTE},
 	{"forward_reply", (cmd_function)w_forward_reply, 0,
 		0, 0, CORE_ONREPLY_ROUTE},
 	{"append_branch", (cmd_function)w_append_branch, 0,
@@ -174,6 +181,8 @@ static cmd_export_t cmds[] = {
 	{"set_send_socket", (cmd_function)w_set_send_socket, 1,
 		fixup_spve_null, fixup_free_spve_null, ANY_ROUTE},
 	{"set_send_socket_name", (cmd_function)w_set_send_socket_name, 1,
+		fixup_spve_null, fixup_free_spve_null, ANY_ROUTE},
+	{"set_send_socket_map", (cmd_function)w_set_send_socket_map, 1,
 		fixup_spve_null, fixup_free_spve_null, ANY_ROUTE},
 	{"set_recv_socket", (cmd_function)w_set_recv_socket, 1,
 		fixup_spve_null, fixup_free_spve_null, ANY_ROUTE},
@@ -304,7 +313,21 @@ static int ki_forward_uac(sip_msg_t *msg)
 {
 	int ret;
 
-	ret = forward_uac_uri(msg, NULL);
+	ret = forward_uac_uri(msg, NULL, 0);
+	if(ret >= 0) {
+		return 1;
+	}
+	return -1;
+}
+
+/**
+ * forward request like initial uac sender, with only one via with branch index
+ */
+static int ki_forward_uac_branch(sip_msg_t *msg, int bindex)
+{
+	int ret;
+
+	ret = forward_uac_uri(msg, NULL, bindex);
 	if(ret >= 0) {
 		return 1;
 	}
@@ -318,7 +341,21 @@ static int ki_forward_uac_uri(sip_msg_t *msg, str *vuri)
 {
 	int ret;
 
-	ret = forward_uac_uri(msg, vuri);
+	ret = forward_uac_uri(msg, vuri, 0);
+	if(ret >= 0) {
+		return 1;
+	}
+	return -1;
+}
+
+/**
+ * forward request like initial uac sender, with only one via with branch index
+ */
+static int ki_forward_uac_uri_branch(sip_msg_t *msg, str *vuri, int bindex)
+{
+	int ret;
+
+	ret = forward_uac_uri(msg, vuri, bindex);
 	if(ret >= 0) {
 		return 1;
 	}
@@ -332,7 +369,27 @@ static int w_forward_uac(sip_msg_t *msg, char *p1, char *p2)
 {
 	int ret;
 
-	ret = forward_uac_uri(msg, NULL);
+	ret = forward_uac_uri(msg, NULL, 0);
+	if(ret >= 0) {
+		return 1;
+	}
+	return -1;
+}
+
+/**
+ * forward request like initial uac sender, with only one via and branch index
+ */
+static int w_forward_uac_branch(sip_msg_t *msg, char *pbindex, char *p2)
+{
+	int ret;
+	int vbindex = 0;
+
+	if(fixup_get_ivalue(msg, (gparam_t *)pbindex, &vbindex)) {
+		LM_ERR("cannot get the branch index parameter\n");
+		return -1;
+	}
+
+	ret = forward_uac_uri(msg, NULL, vbindex);
 	if(ret >= 0) {
 		return 1;
 	}
@@ -352,7 +409,33 @@ static int w_forward_uac_uri(sip_msg_t *msg, char *puri, char *p2)
 		return -1;
 	}
 
-	ret = forward_uac_uri(msg, &vuri);
+	ret = forward_uac_uri(msg, &vuri, 0);
+	if(ret >= 0) {
+		return 1;
+	}
+	return -1;
+}
+
+/**
+ * forward request to uri like initial uac sender, with only one via and branch
+ * index
+ */
+static int w_forward_uac_uri_branch(sip_msg_t *msg, char *puri, char *pbindex)
+{
+	int ret;
+	int vbindex = 0;
+	str vuri = STR_NULL;
+
+	if(fixup_get_svalue(msg, (gparam_t *)puri, &vuri)) {
+		LM_ERR("cannot get the destination parameter\n");
+		return -1;
+	}
+	if(fixup_get_ivalue(msg, (gparam_t *)pbindex, &vbindex)) {
+		LM_ERR("cannot get the branch index parameter\n");
+		return -1;
+	}
+
+	ret = forward_uac_uri(msg, &vuri, vbindex);
 	if(ret >= 0) {
 		return 1;
 	}
@@ -1305,6 +1388,90 @@ static int w_set_send_socket_name(sip_msg_t *msg, char *psock, char *p2)
 }
 
 /**
+ * Set forced send sockets by transport. The update is atomic: the message is
+ * changed only after the complete map has been parsed and validated.
+ */
+static int ki_set_send_socket_map(sip_msg_t *msg, str *smap)
+{
+	send_socket_map_t nmap;
+	struct socket_info *si;
+	param_t *params_list = NULL;
+	param_hooks_t phooks;
+	param_t *pit;
+	str sval;
+	int map_proto;
+	unsigned int seen;
+	int ret;
+
+	if(msg == NULL || smap == NULL) {
+		LM_ERR("bad parameters\n");
+		return -1;
+	}
+
+	memset(&nmap, 0, sizeof(nmap));
+	sval = *smap;
+	trim(&sval);
+	if(sval.len == 0) {
+		msg->force_send_socket_map = nmap;
+		return 1;
+	}
+	if(sval.s[sval.len - 1] == ';') {
+		sval.len--;
+		trim(&sval);
+	}
+	if(sval.len == 0) {
+		msg->force_send_socket_map = nmap;
+		return 1;
+	}
+	if(parse_params(&sval, CLASS_ANY, &phooks, &params_list) < 0) {
+		LM_ERR("cannot parse send socket map [%.*s]\n", sval.len, sval.s);
+		return -1;
+	}
+
+	seen = 0;
+	ret = -1;
+	for(pit = params_list; pit; pit = pit->next) {
+		map_proto = get_valid_proto_id(&pit->name);
+		if(seen & (1U << map_proto)) {
+			LM_ERR("duplicate transport [%.*s] in send socket map\n",
+					pit->name.len, pit->name.s);
+			goto done;
+		}
+
+		si = ksr_get_socket_by_name(&pit->body);
+		if(si == NULL) {
+			LM_ERR("no local socket found with name [%.*s]\n", pit->body.len,
+					pit->body.s);
+			goto done;
+		}
+
+		corex_send_socket_map_set(&nmap, map_proto, si);
+		seen |= 1U << map_proto;
+	}
+
+	msg->force_send_socket_map = nmap;
+	ret = 1;
+
+done:
+	free_params(params_list);
+	return ret;
+}
+
+/**
+ *
+ */
+static int w_set_send_socket_map(sip_msg_t *msg, char *pmap, char *p2)
+{
+	str smap;
+
+	if(fixup_get_svalue(msg, (gparam_t *)pmap, &smap) != 0) {
+		LM_ERR("cannot get send socket map value\n");
+		return -1;
+	}
+	return ki_set_send_socket_map(msg, &smap);
+}
+
+/**
  *
  */
 static int ki_set_recv_socket(sip_msg_t *msg, str *ssock)
@@ -1765,6 +1932,11 @@ static sr_kemi_t sr_kemi_corex_exports[] = {
 		{ SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
+	{ str_init("corex"), str_init("set_send_socket_map"),
+		SR_KEMIP_INT, ki_set_send_socket_map,
+		{ SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
 	{ str_init("corex"), str_init("set_recv_socket"),
 		SR_KEMIP_INT, ki_set_recv_socket,
 		{ SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE,
@@ -1845,9 +2017,19 @@ static sr_kemi_t sr_kemi_corex_exports[] = {
 		{ SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
+	{ str_init("corex"), str_init("forward_uac_branch"),
+		SR_KEMIP_INT, ki_forward_uac_branch,
+		{ SR_KEMIP_INT, SR_KEMIP_NONE, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
 	{ str_init("corex"), str_init("forward_uac_uri"),
 		SR_KEMIP_INT, ki_forward_uac_uri,
 		{ SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("corex"), str_init("forward_uac_uri_branch"),
+		SR_KEMIP_INT, ki_forward_uac_uri_branch,
+		{ SR_KEMIP_STR, SR_KEMIP_INT, SR_KEMIP_NONE,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
 

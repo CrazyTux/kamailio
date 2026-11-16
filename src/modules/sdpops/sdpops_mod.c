@@ -81,7 +81,7 @@ static int sdp_get_sess_version(
 		sip_msg_t *msg, str *sess_version, long *sess_version_num);
 static int sdp_set_sess_version(
 		sip_msg_t *msg, str *sess_version, long *sess_version_num);
-static int w_sdp_get_address_family(sip_msg_t *msg);
+static int w_sdp_get_address_family(sip_msg_t *msg, char *p1, char *p2);
 
 static int pv_get_sdp(sip_msg_t *msg, pv_param_t *param, pv_value_t *res);
 static int pv_set_sdp(
@@ -1016,12 +1016,13 @@ it helps to extract IP address family at c line from sdp
 			6 for  IP6
 
 */
-static int w_sdp_get_address_family(sip_msg_t *msg)
+static int ki_sdp_get_address_family(sip_msg_t *msg)
 {
-
 	sdp_session_cell_t *session;
+	sdp_stream_cell_t *stream;
 	int sdp_session_num;
 	int result = -1;
+
 	if(parse_sdp(msg) < 0) {
 		LM_ERR("Unable to parse sdp body \n");
 		return -1;
@@ -1030,23 +1031,49 @@ static int w_sdp_get_address_family(sip_msg_t *msg)
 	sdp_session_num = 0;
 
 	for(;;) {
-
 		session = get_sdp_session(msg, sdp_session_num);
 		if(!session)
 			break;
 
-		if(session->pf == AF_INET) {
-			result = 4;
-		} else if(session->pf == AF_INET6) {
-			result = 6;
+		if(session->ip_addr.s != NULL && session->ip_addr.len > 0) {
+			if(session->pf == AF_INET) {
+				result = 4;
+			} else if(session->pf == AF_INET6) {
+				result = 6;
+			} else {
+				result = -1;
+			}
 		} else {
-			result = -1;
+			stream = session->streams;
+			while(stream) {
+				if(stream->ip_addr.s != NULL && stream->ip_addr.len > 0) {
+					if(stream->pf == AF_INET) {
+						result = 4;
+					} else if(stream->pf == AF_INET6) {
+						result = 6;
+					} else {
+						result = -1;
+					}
+					break;
+				}
+				stream = stream->next;
+			}
+		}
+
+		if(result == 4 || result == 6) {
+			break;
 		}
 		sdp_session_num++;
 	}
 
 	return result;
 }
+
+static int w_sdp_get_address_family(sip_msg_t *msg, char *p1, char *p2)
+{
+	return ki_sdp_get_address_family(msg);
+}
+
 /**
  * @brief remove streams matching the m='media'
  * @return -1 - error; 0 - not found; >=1 - found
@@ -2108,6 +2135,7 @@ int sdpops_attr_val(str *payload, str *attr, str *val)
 static int pv_get_sdp(sip_msg_t *msg, pv_param_t *param, pv_value_t *res)
 {
 	sdp_info_t *sdp = NULL;
+	sdp_stream_cell_t *stream0 = NULL;
 	str sess_version = STR_NULL;
 	long sess_version_num = 0;
 	unsigned int uport = 0;
@@ -2186,35 +2214,27 @@ static int pv_get_sdp(sip_msg_t *msg, pv_param_t *param, pv_value_t *res)
 			return pv_get_null(msg, param, res);
 		case 4:
 			/* m0:rtp:port */
-			if(sdp->sessions == NULL) {
+			/* streams are stored in reverse parsing order - use
+			 * get_sdp_stream_sdp() to fetch the first m-line (m0) */
+			stream0 = get_sdp_stream_sdp(sdp, 0, 0);
+			if(stream0 == NULL) {
 				return pv_get_null(msg, param, res);
 			}
-			if(sdp->sessions->streams == NULL) {
-				return pv_get_null(msg, param, res);
-			}
-			if(sdp->sessions->streams->port.s != NULL
-					&& sdp->sessions->streams->port.len > 0) {
-				return pv_get_strval(
-						msg, param, res, &sdp->sessions->streams->port);
+			if(stream0->port.s != NULL && stream0->port.len > 0) {
+				return pv_get_strval(msg, param, res, &stream0->port);
 			}
 			return pv_get_null(msg, param, res);
 		case 5:
 			/* m0:rtcp:port */
-			if(sdp->sessions == NULL) {
+			stream0 = get_sdp_stream_sdp(sdp, 0, 0);
+			if(stream0 == NULL) {
 				return pv_get_null(msg, param, res);
 			}
-			if(sdp->sessions->streams == NULL) {
-				return pv_get_null(msg, param, res);
+			if(stream0->rtcp_port.s != NULL && stream0->rtcp_port.len > 0) {
+				return pv_get_strval(msg, param, res, &stream0->rtcp_port);
 			}
-			if(sdp->sessions->streams->rtcp_port.s != NULL
-					&& sdp->sessions->streams->rtcp_port.len > 0) {
-				return pv_get_strval(
-						msg, param, res, &sdp->sessions->streams->rtcp_port);
-			}
-			if(sdp->sessions->streams->port.s != NULL
-					&& sdp->sessions->streams->port.len > 0) {
-				if(str2int(&sdp->sessions->streams->port, &uport) < 0
-						|| uport >= USHRT_MAX) {
+			if(stream0->port.s != NULL && stream0->port.len > 0) {
+				if(str2int(&stream0->port, &uport) < 0 || uport >= USHRT_MAX) {
 					return pv_get_null(msg, param, res);
 				}
 				uport++;
@@ -2251,33 +2271,24 @@ static int pv_get_sdp(sip_msg_t *msg, pv_param_t *param, pv_value_t *res)
 			}
 		case 7:
 			/* m0:raw - all (raw) lines for m0 stream */
-			if(sdp->sessions == NULL) {
+			stream0 = get_sdp_stream_sdp(sdp, 0, 0);
+			if(stream0 == NULL) {
 				return pv_get_null(msg, param, res);
 			}
-			if(sdp->sessions->streams == NULL) {
-				return pv_get_null(msg, param, res);
-			}
-			if(sdp->sessions->streams->raw_stream.s != NULL
-					&& sdp->sessions->streams->raw_stream.len > 0) {
-				return pv_get_strval(
-						msg, param, res, &sdp->sessions->streams->raw_stream);
+			if(stream0->raw_stream.s != NULL && stream0->raw_stream.len > 0) {
+				return pv_get_strval(msg, param, res, &stream0->raw_stream);
 			}
 			return pv_get_null(msg, param, res);
 		case 8:
 			/* m0:b:AS */
-			if(sdp->sessions == NULL) {
+			stream0 = get_sdp_stream_sdp(sdp, 0, 0);
+			if(stream0 == NULL) {
 				return pv_get_null(msg, param, res);
 			}
-			if(sdp->sessions->streams == NULL) {
-				return pv_get_null(msg, param, res);
-			}
-			if(sdp->sessions->streams->raw_stream.s != NULL
-					&& sdp->sessions->streams->raw_stream.len > 0) {
+			if(stream0->raw_stream.s != NULL && stream0->raw_stream.len > 0) {
 				sattr.s = "b=AS:";
 				sattr.len = 5;
-				if(sdpops_attr_val(
-						   &sdp->sessions->streams->raw_stream, &sattr, &sval)
-						< 0) {
+				if(sdpops_attr_val(&stream0->raw_stream, &sattr, &sval) < 0) {
 					return pv_get_null(msg, param, res);
 				}
 				return pv_get_strval(msg, param, res, &sval);
@@ -2285,19 +2296,14 @@ static int pv_get_sdp(sip_msg_t *msg, pv_param_t *param, pv_value_t *res)
 			return pv_get_null(msg, param, res);
 		case 9:
 			/* m0:b:RR */
-			if(sdp->sessions == NULL) {
+			stream0 = get_sdp_stream_sdp(sdp, 0, 0);
+			if(stream0 == NULL) {
 				return pv_get_null(msg, param, res);
 			}
-			if(sdp->sessions->streams == NULL) {
-				return pv_get_null(msg, param, res);
-			}
-			if(sdp->sessions->streams->raw_stream.s != NULL
-					&& sdp->sessions->streams->raw_stream.len > 0) {
+			if(stream0->raw_stream.s != NULL && stream0->raw_stream.len > 0) {
 				sattr.s = "b=RR:";
 				sattr.len = 5;
-				if(sdpops_attr_val(
-						   &sdp->sessions->streams->raw_stream, &sattr, &sval)
-						< 0) {
+				if(sdpops_attr_val(&stream0->raw_stream, &sattr, &sval) < 0) {
 					return pv_get_null(msg, param, res);
 				}
 				return pv_get_strval(msg, param, res, &sval);
@@ -2305,19 +2311,14 @@ static int pv_get_sdp(sip_msg_t *msg, pv_param_t *param, pv_value_t *res)
 			return pv_get_null(msg, param, res);
 		case 10:
 			/* m0:b:RS */
-			if(sdp->sessions == NULL) {
+			stream0 = get_sdp_stream_sdp(sdp, 0, 0);
+			if(stream0 == NULL) {
 				return pv_get_null(msg, param, res);
 			}
-			if(sdp->sessions->streams == NULL) {
-				return pv_get_null(msg, param, res);
-			}
-			if(sdp->sessions->streams->raw_stream.s != NULL
-					&& sdp->sessions->streams->raw_stream.len > 0) {
+			if(stream0->raw_stream.s != NULL && stream0->raw_stream.len > 0) {
 				sattr.s = "b=RS:";
 				sattr.len = 5;
-				if(sdpops_attr_val(
-						   &sdp->sessions->streams->raw_stream, &sattr, &sval)
-						< 0) {
+				if(sdpops_attr_val(&stream0->raw_stream, &sattr, &sval) < 0) {
 					return pv_get_null(msg, param, res);
 				}
 				return pv_get_strval(msg, param, res, &sval);
@@ -3021,6 +3022,11 @@ static sr_kemi_t sr_kemi_sdpops_exports[] = {
 	{ str_init("sdpops"), str_init("sdp_iterator_value"),
 		SR_KEMIP_XVAL, ki_sdp_iterator_value,
 		{ SR_KEMIP_STR, SR_KEMIP_NONE, SR_KEMIP_NONE,
+			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
+	},
+	{ str_init("sdpops"), str_init("sdp_get_address_family"),
+		SR_KEMIP_INT, ki_sdp_get_address_family,
+		{ SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE,
 			SR_KEMIP_NONE, SR_KEMIP_NONE, SR_KEMIP_NONE }
 	},
 
